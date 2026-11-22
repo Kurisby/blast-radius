@@ -887,6 +887,18 @@ class Analyzer:
                         names.append(f"{path}|#")
             elif kind == "attr" and w == "A":
                 names = [f"{path}|@"]
+                init = f"{path}|@init"
+                if init in nontest:
+                    notes.append(f"state diff: {init} read outside tests")
+                    return None
+                slot = (a.get("mirror") or {}).get(path.rsplit(".", 1)[-1])
+                if init in a["attrs"]:
+                    if slot is None:
+                        names.append(init)
+                    else:
+                        # copied into the tokenizer core when a tokenizer is built: only tests
+                        # that build one from this class and read that core slot can see it
+                        self._intersect_entries(plan, init, f"{slot}|@")
             else:
                 notes.append(f"state diff: {kind} {path} not profiled")
                 return None
@@ -897,6 +909,18 @@ class Analyzer:
                 self.maps.attr_entry(plan, n)
         notes.append(f"state diff: {len(res['diff'])} changed -> {len(plan)} tests")
         return plan
+
+    def _intersect_entries(self, plan: dict, n1: str, n2: str) -> None:
+        """Add the tests both profile entries list (items: what either lists for the test)."""
+        p1, p2 = {}, {}
+        self.maps.attr_entry(p1, n1)
+        self.maps.attr_entry(p2, n2)
+        for t in set(p1) & set(p2):
+            v = FULL if p1[t] is FULL or p2[t] is FULL else (p1[t] | p2[t])
+            if v is FULL or (t in plan and plan[t] is FULL):
+                plan[t] = FULL
+            else:
+                plan[t] = plan.get(t, set()) | v
 
     def analyze(self, patch_text: str) -> tuple[dict, list, dict]:
         self.touched = []

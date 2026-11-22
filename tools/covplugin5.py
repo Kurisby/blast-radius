@@ -450,8 +450,114 @@ class _AttrRec:
 
     def __get__(self, obj, objtype=None):
         if not getattr(_tl, "busy", False):
-            _r()["keys"].add((self._owner, "@"))
+            # read while Tokenizer._init_core hands the settings to TokenizerCore
+            _r()["keys"].add((self._owner, "@init" if getattr(_tl, "init", False) else "@"))
         return self._value
+
+
+class _SlotRec:
+    """Recording wrapper for a TokenizerCore slot that stores a tokenizer setting."""
+    __slots__ = ("_d", "_owner")
+
+    def __init__(self, d, owner):
+        self._d = d
+        self._owner = owner
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self._d
+        if not getattr(_tl, "busy", False):
+            _r()["keys"].add((self._owner, "@"))
+        return self._d.__get__(obj, objtype)
+
+    def __set__(self, obj, value):
+        self._d.__set__(obj, value)
+
+    def __delete__(self, obj):
+        self._d.__delete__(obj)
+
+
+def _mirror_map():
+    """{setting name: core slot} for the keyword arguments of Tokenizer._init_core that are a
+    plain read of a setting (self.X, self.dialect.X, bool(self.X)) and that TokenizerCore.__init__
+    only stores (self.k = k, no other use of k)."""
+    tk = sys.modules["sqlglot.tokens"]
+    tc = sys.modules["sqlglot.tokenizer_core"]
+    t1 = ast.parse(open(tk.__file__).read())
+    t2 = ast.parse(open(tc.__file__).read())
+
+    def method(tree, cls, name):
+        for c in tree.body:
+            if isinstance(c, ast.ClassDef) and c.name == cls:
+                for f in c.body:
+                    if isinstance(f, ast.FunctionDef) and f.name == name:
+                        return f
+        return None
+
+    ic = method(t1, "Tokenizer", "_init_core")
+    init = method(t2, "TokenizerCore", "__init__")
+    if ic is None or init is None:
+        return {}
+    stored = set()
+    params = [a.arg for a in init.args.args[1:] + init.args.kwonlyargs]
+    for p_ in params:
+        uses = [n for n in ast.walk(init) if isinstance(n, ast.Name) and n.id == p_]
+        ok = len(uses) == 1 and any(
+            isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Attribute)
+            and isinstance(st.targets[0].value, ast.Name) and st.targets[0].value.id == "self"
+            and st.targets[0].attr == p_ and isinstance(st.value, ast.Name) and st.value.id == p_
+            for st in init.body)
+        if ok:
+            stored.add(p_)
+    calls = [n for n in ast.walk(ic) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "TokenizerCore"]
+    if len(calls) != 1:
+        return {}
+    res = {}
+    for kw in calls[0].keywords:
+        v = kw.value
+        if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "bool" and len(v.args) == 1:
+            v = v.args[0]
+        if not isinstance(v, ast.Attribute):
+            continue
+        base = v.value
+        if not ((isinstance(base, ast.Name) and base.id == "self") or (
+                isinstance(base, ast.Attribute) and base.attr == "dialect"
+                and isinstance(base.value, ast.Name) and base.value.id == "self")):
+            continue
+        if kw.arg in stored and v.attr not in res:
+            res[v.attr] = kw.arg
+        elif v.attr in res:
+            res.pop(v.attr)  # read for two arguments: keep it a plain read
+    return res
+
+
+def _wrap_tokenizer_mirror():
+    tk = sys.modules.get("sqlglot.tokens")
+    tc = sys.modules.get("sqlglot.tokenizer_core")
+    if tk is None or tc is None:
+        return
+    mm = _mirror_map()
+    core = tc.TokenizerCore
+    mrec = _rec.setdefault("<mirror>", _new())["keys"]
+    for attr, slot in mm.items():
+        d = core.__dict__.get(slot)
+        if type(d).__name__ != "member_descriptor":
+            continue
+        owner = f"{core.__module__}:{core.__qualname__}.{slot}"
+        setattr(core, slot, _SlotRec(d, owner))
+        mrec.add((attr, owner))
+    orig = tk.Tokenizer.__dict__["_init_core"]
+
+    def _init_core(self, *a, **k):
+        prev = getattr(_tl, "init", False)
+        _tl.init = True
+        try:
+            return orig(self, *a, **k)
+        finally:
+            _tl.init = prev
+
+    tk.Tokenizer._init_core = _init_core
 
 
 def _wrap_cls(cls, seen):
@@ -519,6 +625,7 @@ def _wrap_all():
         for v in list(vars(mod).values()):
             if isinstance(v, type) and v.__module__ == modname and id(v) not in seen:
                 _wrap_cls(v, seen)
+    _wrap_tokenizer_mirror()
     # the generator caches a per-class copy of TRANSFORMS (plus *_sql methods) on first use:
     # record lookups in that copy as lookups of the TRANSFORMS that it was built from
     g = sys.modules.get("sqlglot.generator")

@@ -4,7 +4,9 @@ into app/attrs.json.gz.
 usage: build_attrs.py DUMPDIR[,DUMPDIR...] tests.json OUT
 
 Entries are "<module>:<Class qualname>.<attr>|<key>" where key is "@" (attribute read),
-a dict key name (see statefp.keyname), "*" (whole-dict use) or "#" (len). Accesses
+a dict key name (see statefp.keyname), "*" (whole-dict use), "#" (len) or "@init" (read
+while Tokenizer._init_core hands settings to TokenizerCore; "mirror" names the core slot
+that stores each such setting). Accesses
 outside a test (collection, between tests) are listed in "nontest".
 """
 import collections
@@ -23,6 +25,7 @@ A_glob = collections.defaultdict(set)
 A_item = collections.defaultdict(lambda: collections.defaultdict(set))
 nontest = set()
 wrapped = {}
+mirror = {}
 for p in [q for d in dumps.split(",") for q in glob.glob(os.path.join(d, "*.json"))]:
     d = json.load(open(p))
     for ctx, rec in d.items():
@@ -31,6 +34,11 @@ for p in [q for d in dumps.split(",") for q in glob.glob(os.path.join(d, "*.json
             for x in keys:
                 owner, _, kind = x.rpartition("|")
                 wrapped[owner] = kind
+            continue
+        if ctx == "<mirror>":
+            for x in keys:
+                attr, _, slot = x.partition("|")
+                mirror[attr] = slot
             continue
         base, _, item = ctx.partition("#")
         n = idx.get(base)
@@ -61,7 +69,7 @@ for x, st in A_all.items():
     if x in A_item:
         e.append({str(t): sid(v) for t, v in A_item[x].items()})
     attrs[x] = e
-m = {"ids": ids, "attrs": attrs, "nontest": sorted(nontest), "wrapped": wrapped,
+m = {"ids": ids, "attrs": attrs, "nontest": sorted(nontest), "wrapped": wrapped, "mirror": mirror,
      "sets": [list(k) for k in sorted(pool, key=pool.get)]}
 with gzip.open(out, "wt", compresslevel=9) as fh:
     json.dump(m, fh, separators=(",", ":"))

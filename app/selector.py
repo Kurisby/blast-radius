@@ -45,6 +45,7 @@ PER_JOB_OVERHEAD = 0.3
 SAFETY = float(os.environ.get("BR_SAFETY", "1.4"))
 P_FAIL_LIKELY = float(os.environ.get("BR_P_LIKELY", "0.95"))  # changed optimizer fixture item: its reader almost always fails
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.05"))
+SIM_SLOW = float(os.environ.get("BR_SIM_SLOW", "1"))  # local test only: act as if CPU were this much slower
 BUDGET_MULT = float(os.environ.get("BR_BUDGET_MULT", "2.5"))  # 0: budget is the listing cost alone
 
 
@@ -359,14 +360,14 @@ def main() -> None:
         for tid, spec in sorted(pl["specs"].items()):
             # CPU seconds; a timeout only lists the test, it can never miss a failure
             est = spec.get("_est", 0.3)
-            limit = 0.8 + 3.0 * max(est, min(spec.get("_full", est), 2 * est + 0.5))
+            limit = (0.8 + 3.0 * max(est, min(spec.get("_full", est), 2 * est + 0.5))) / SIM_SLOW
             if spec.get("replica"):
                 limit = 3.0
             items.append((tid, limit, spec))
         ran = {maps.number_by_id[tid] for tid in pl["specs"]}
         # running can never be worth more CPU than listing what it runs
         cap = BUDGET_MULT * pl["run_est"] + 0.8 if BUDGET_MULT > 0 else float("inf")
-        budget = max(1.0, min(output_cost(ran, duration_ms), cap))
+        budget = max(1.0, min(output_cost(ran, duration_ms), cap)) / SIM_SLOW
         pl["budget"] = budget
         jobs.append((c, pl["files"], items, budget, module_names(pl["files"])))
     results = {}
