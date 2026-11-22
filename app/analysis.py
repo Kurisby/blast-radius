@@ -448,6 +448,7 @@ class Analyzer:
         self._starts = {}
         self._all_sources = None
         self._trees = {}
+        self._tests_text = None
         self.touched = []      # [(rel, lines)] statement-level changes of the last analyze()
         self.nonlocal_change = False
         self.hard_nonlocal = False  # a non-local change the import-time state diff cannot explain
@@ -890,6 +891,14 @@ class Analyzer:
         a = self.maps.attrs()
         if a is None or os.environ.get("BR_STATEFP_OFF") == "1":
             return None
+        if os.environ.get("BR_STATIC_SETTING") != "0":
+            path = self.static_setting_change(files, a)
+            if path is not None:
+                plan: dict = {}
+                self.maps.attr_entry(plan, f"{path}|@")
+                self.state_names = {f"{path}|@"}
+                notes.append(f"state diff: static {path.rsplit('.', 1)[-1]} -> {len(plan)} tests")
+                return plan
         import runner
 
         self._fp_n += 1
@@ -951,6 +960,160 @@ class Analyzer:
         notes.append(f"state diff: {len(res['diff'])} changed -> {len(plan)} tests")
         self.state_names = used
         return plan
+
+    def static_setting_change(self, files: dict, a: dict) -> str | None:
+        """The attribute path when the patch only changes the literal value of one plain
+        setting in a parser or generator class body: those classes have no metaclass, so when
+        no other code reads the name while modules are imported, the state diff could only
+        report that one attribute and need not run. None otherwise."""
+        if len(files) != 1:
+            return None
+        ((rel, patched),) = files.items()
+        if not (rel.startswith(("sqlglot/generators/", "sqlglot/parsers/"))
+                or rel in ("sqlglot/generator.py", "sqlglot/parser.py")):
+            return None
+        original = self.source(rel)
+        if not original or patched is None:
+            return None
+        la, lb = original.split("\n"), patched.split("\n")
+        if len(la) != len(lb):
+            return None
+        changed = [i for i in range(len(la)) if la[i] != lb[i]]
+        if len(changed) != 1:
+            return None
+        line = changed[0] + 1
+        idx = self.index(rel)
+        try:
+            ta = idx.tree if idx is not None else ast.parse(original)
+            tb = ast.parse(patched)
+        except SyntaxError:
+            return None
+
+        def find(body, prefix):
+            # (qualname, statement) of the class-body statement spanning the line
+            for st in body:
+                if not (st.lineno <= line <= st.end_lineno):
+                    continue
+                if not isinstance(st, ast.ClassDef) or st.decorator_list or st.keywords:
+                    return None
+                q = f"{prefix}.{st.name}" if prefix else st.name
+                for inner in st.body:
+                    if inner.lineno <= line <= inner.end_lineno:
+                        return find([inner], q) if isinstance(inner, ast.ClassDef) else (q, inner)
+                return None
+            return None
+
+        def setting(st):
+            if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                name, v = st.targets[0].id, st.value
+            elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.simple \
+                    and st.value is not None:
+                name, v = st.target.id, st.value
+            else:
+                return None
+            if isinstance(v, ast.UnaryOp) and isinstance(v.op, (ast.USub, ast.UAdd)):
+                v = v.operand
+            if not (isinstance(v, ast.Constant) and isinstance(v.value, (bool, int, float, str, type(None)))):
+                return None
+            return name
+
+        fa, fb = find(ta.body, ""), find(tb.body, "")
+        if fa is None or fb is None or fa[0] != fb[0] or type(fa[1]) is not type(fb[1]):
+            return None
+        qual, sa = fa
+        sb = fb[1]
+        name = setting(sa)
+        if name is None or setting(sb) != name or (sa.lineno, sa.end_lineno) != (sb.lineno, sb.end_lineno):
+            return None
+        if isinstance(sa, ast.AnnAssign) and ast.dump(sa.annotation) != ast.dump(sb.annotation):
+            return None
+        path = f"{rel[:-3].replace('/', '.')}:{qual}.{name}"
+        if a["wrapped"].get(path) != "A":
+            return None
+        if f"{path}|@" in a["nontest"] or f"{path}|@init" in a["nontest"] or f"{path}|@init" in a["attrs"]:
+            return None
+        if (a.get("mirror") or {}).get(name) is not None:
+            return None
+        word = re.compile(r"\b%s\b" % re.escape(name))
+        if self._tests_text is None:
+            parts = []
+            for p in sorted((self.root / "tests").rglob("*.py")):
+                try:
+                    parts.append(p.read_text(encoding="utf-8"))
+                except OSError:
+                    return None
+            self._tests_text = "\n".join(parts)
+        if word.search(self._tests_text):
+            return None  # a test may read or set it itself
+        pkg = self.maps.pkg_import_lines
+        for rel2, src in self.all_sources():
+            if not src or name not in src or not word.search(src):
+                continue
+            tree = self._trees.get(rel2)
+            if tree is None and rel2 == rel:
+                tree = ta
+            if tree is None:
+                try:
+                    tree = self._trees[rel2] = ast.parse(src)
+                except SyntaxError:
+                    return None
+            imp = pkg.get(rel2, set()) if pkg is not None else self.maps.import_lines.get(rel2, set())
+            starts = self._line_starts(rel2, src)
+            occ = sorted({bisect.bisect_right(starts, m.start()) for m in word.finditer(src)})
+
+            def near(node):
+                lo = getattr(node, "lineno", None)
+                if lo is None:
+                    return True
+                hi = getattr(node, "end_lineno", None) or lo
+                i = bisect.bisect_left(occ, lo)
+                return i < len(occ) and occ[i] <= hi
+
+            def visit(node, inside):
+                """False when the name is used where it runs at import time."""
+                for ch in ast.iter_child_nodes(node):
+                    if not near(ch):
+                        continue
+                    if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        parts = [(d, inside) for d in ch.decorator_list] + [(ch.args, inside)]
+                        if ch.returns is not None:
+                            parts.append((ch.returns, inside))
+                        parts += [(st, True) for st in ch.body]
+                        for sub, ins in parts:
+                            if near(sub) and (not self._static_use(sub, name, word, ins, imp) or not visit(sub, ins)):
+                                return False
+                        continue
+                    if isinstance(ch, ast.Lambda):
+                        if not (visit(ch.args, inside) and self._static_use(ch.body, name, word, True, imp)
+                                and visit(ch.body, True)):
+                            return False
+                        continue
+                    if isinstance(ch, ast.Expr) and isinstance(ch.value, ast.Constant):
+                        continue  # a docstring
+                    if not self._static_use(ch, name, word, inside, imp) or not visit(ch, inside):
+                        return False
+                return True
+
+            if not visit(tree, False):
+                return None
+        return path
+
+    @staticmethod
+    def _static_use(n, name, word, inside, imp) -> bool:
+        """False when node n uses the name (a load, an attribute, a string naming it) where
+        that runs at import time: outside function bodies, or on a line run while importing."""
+        if isinstance(n, ast.Name) and n.id == name:
+            if isinstance(n.ctx, ast.Store) and not inside:
+                return True  # the setting itself, or a subclass's own value
+        elif isinstance(n, ast.Attribute) and n.attr == name:
+            pass
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and word.search(n.value):
+            pass
+        else:
+            return True
+        if not inside:
+            return False
+        return not any(x in imp for x in range(n.lineno, (n.end_lineno or n.lineno) + 1))
 
     def slot_use_plan(self, slot: str) -> dict | None:
         """Tests that ran a line where the tokenizer core slot's value is used: every load of
