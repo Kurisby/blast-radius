@@ -718,6 +718,43 @@ TPCDS_HASHES = {}  # item -> sha1 of the optimizer output execute() works from (
 TPCDS_PHASHES = {}  # item -> sha1 of the parsed query the pool child receives (pinned commit)
 TPCDS_DUCKQ = {}  # item -> DuckDB SQL of the item at the pinned commit (key into FRAMES)
 TPCDS_TIMES = {}  # item -> {"exec": CPU of running it here, ...} (pinned commit)
+_TPCDS_CG = {}  # item -> [[input dump json, generated source], ...] (loaded on first use)
+
+
+def tpcds_codegen():
+    """The executor's generator calls per TPC-DS query at the pinned commit."""
+    if "d" not in _TPCDS_CG:
+        try:
+            import gzip
+            import json as _json
+            with gzip.open(os.path.join(APP, "tpcds_cg.json.gz"), "rt") as fh:
+                _TPCDS_CG["d"] = {int(k): v for k, v in _json.load(fh).items()}
+        except Exception as e:  # noqa: BLE001
+            log("tpcds codegen record unavailable", repr(e))
+            _TPCDS_CG["d"] = {}
+    return _TPCDS_CG["d"]
+
+
+def tpcds_codegen_same(rec):
+    """Replay the recorded generator calls with the code under test: True when every call
+    gives the recorded source and leaves its input as it was (the run then compiles and
+    runs exactly what it did at the pinned commit)."""
+    import json as _json
+    from sqlglot.executor.python import Python
+    from sqlglot.serde import dump, load
+
+    if not rec:
+        return False
+    gen = Python().generator(identify=True, comments=False)
+    for d_in, out in rec:
+        e = load(_json.loads(d_in))
+        if gen.generate(e) != out:
+            return False
+        if _json.dumps(dump(e), sort_keys=True, default=str) != d_in:
+            return False
+    return True
+
+
 DUCK_QUERY = 0.3  # CPU of one DuckDB query over the TPC-DS CSV views
 BOARD_CPU = float(os.environ.get("BR_BOARD_CPU", "1.5"))  # scorer CPU seconds per local one
 FRAMES = None     # {"tpch": {sql: df}, "tpcds": {sql: df}}
@@ -1047,6 +1084,17 @@ class TestHooks:
                 continue
             if h != TPCDS_HASHES.get(i):
                 run.add(i)
+        cgen = [i for i in plan.get("cg", ()) if i not in run]
+        if cgen:
+            rec = tpcds_codegen()
+            for i in cgen:
+                try:
+                    same = tpcds_codegen_same(rec.get(i))
+                except Exception:  # noqa: BLE001
+                    same = False
+                if not same:
+                    run.add(i)
+            self.out.write(f"NOTE tpcds codegen replayed {len(cgen)} items\n")
         frames = (FRAMES or {}).get("tpcds", {})
         duck_new = []
         for i in plan.get("duck", ()):
