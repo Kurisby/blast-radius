@@ -135,10 +135,6 @@ def tpcds_gate(gate, est):
     """Tests whose failure settles the TPC-DS executor test as failing without running it.
     Listing it costs ~21 s whenever it would have passed, so a gate only pays off when the
     run is costly and the gate test is a close proxy (the other TPC executor tests)."""
-    if est <= 3.0:
-        return []
-    if est <= 10.0:
-        return [g for g in gate if g in STRONG_GATES]
     return gate
 
 
