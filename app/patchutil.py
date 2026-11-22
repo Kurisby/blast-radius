@@ -13,11 +13,30 @@ def parse_patch(text: str) -> list[dict]:
     """Return [{'old': path|None, 'new': path|None, 'hunks': [...]}] for a unified diff."""
     files: list[dict] = []
     cur = None
-    lines = text.split("\n")
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.startswith("diff --git "):
+    remaining_old = remaining_new = 0
+    for line in text.split("\n"):
+        if cur is not None and cur["hunks"] and (remaining_old > 0 or remaining_new > 0):
+            tag = line[:1]
+            if line == "":
+                line, tag = " ", " "  # a blank context line that lost its leading space
+            if tag == " ":
+                remaining_old -= 1
+                remaining_new -= 1
+            elif tag == "-":
+                remaining_old -= 1
+            elif tag == "+":
+                remaining_new -= 1
+            elif tag == "\\":
+                pass
+            else:
+                remaining_old = remaining_new = 0
+                tag = None
+            if tag is not None:
+                cur["hunks"][-1]["lines"].append(line)
+                continue
+        if line.startswith("\\") and cur is not None and cur["hunks"]:
+            cur["hunks"][-1]["lines"].append(line)
+        elif line.startswith("diff --git "):
             cur = {"old": None, "new": None, "hunks": [], "header": line}
             files.append(cur)
         elif line.startswith("--- ") and cur is not None and not cur["hunks"]:
@@ -29,15 +48,11 @@ def parse_patch(text: str) -> list[dict]:
         elif line.startswith("@@") and cur is not None:
             m = HUNK.match(line)
             if m:
+                remaining_old = int(m.group(2)) if m.group(2) is not None else 1
+                remaining_new = int(m.group(4)) if m.group(4) is not None else 1
                 cur["hunks"].append(
                     {"old_start": int(m.group(1)), "new_start": int(m.group(3)), "lines": []}
                 )
-        elif cur is not None and cur["hunks"] and line[:1] in (" ", "+", "-", "\\"):
-            cur["hunks"][-1]["lines"].append(line)
-        elif cur is not None and cur["hunks"] and line == "":
-            # a blank context line may lose its leading space in some tools
-            cur["hunks"][-1]["lines"].append(" ")
-        i += 1
     for f in files:
         if f["old"] is None and f["new"] is None:
             m = re.match(r"diff --git a/(\S+) b/(\S+)", f["header"])
@@ -79,20 +94,25 @@ def apply_hunks(original: str, hunks: list[dict]) -> str | None:
     return "\n".join(out)
 
 
-def changed_old_lines(hunks: list[dict]) -> list[tuple[int, str]]:
-    """Old-file line numbers touched: ('-', n) for removed lines, ('+', n) for insert-before-n."""
+def changed_old_lines(hunks: list[dict]) -> list[tuple[str, int]]:
+    """Old-file lines touched: ('-', n) for removed/replaced lines, ('+', n) for a pure
+    insertion before old line n. Added lines right after removed ones replace them."""
     res = []
     for h in hunks:
         o = h["old_start"]
+        prev_removed = False
         for l in h["lines"]:
             tag = l[:1]
             if tag == " ":
                 o += 1
+                prev_removed = False
             elif tag == "-":
                 res.append(("-", o))
                 o += 1
+                prev_removed = True
             elif tag == "+":
-                res.append(("+", o))
+                if not prev_removed:
+                    res.append(("+", o))
     return res
 
 
@@ -192,3 +212,37 @@ def fixture_lines(text: str):
             out.append("\n".join(lines))
             lines = []
     return out
+
+
+class _NoneCmp(ast.NodeTransformer):
+    """Rewrite `x == None` / `x != None` as `x is None` / `x is not None`."""
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        ops = []
+        operands = [node.left] + list(node.comparators)
+        for i, op in enumerate(node.ops):
+            a, b = operands[i], operands[i + 1]
+            is_none = any(isinstance(x, ast.Constant) and x.value is None for x in (a, b))
+            if is_none and isinstance(op, ast.Eq):
+                op = ast.Is()
+            elif is_none and isinstance(op, ast.NotEq):
+                op = ast.IsNot()
+            ops.append(op)
+        node.ops = ops
+        return node
+
+
+def none_compare_equivalent(old: str, new: str) -> bool:
+    """True if the sources differ only by `is None` <-> `== None` style swaps.
+
+    In sqlglot no __eq__ returns True for None (Expr, Dialect and _Dialect compare by type),
+    so the two spellings behave the same."""
+    try:
+        a = ast.parse(old)
+        b = ast.parse(new)
+    except SyntaxError:
+        return False
+    if ast.dump(a) == ast.dump(b):
+        return False  # identical ASTs are handled as comment-only
+    return ast.dump(_NoneCmp().visit(a)) == ast.dump(_NoneCmp().visit(b))

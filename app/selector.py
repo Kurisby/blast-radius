@@ -1,229 +1,45 @@
 """Blast Radius selector.
 
-For each patch, find the tests that can observe the change (coverage maps built from the
-pinned sqlglot commit), and print them split across workers.
+For each patch: find the tests (and fixture items) that can observe the change from coverage
+maps of the pinned sqlglot commit, run them against the patched tree inside this container,
+and print only the tests that fail. When running would cost more than just listing the
+candidates, list them instead.
 """
 from __future__ import annotations
 
-import gzip
 import json
 import os
 import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from patchutil import (  # noqa: E402
-    FuncIndex,
-    apply_hunks,
-    changed_old_lines,
-    compiles,
-    fixture_lines,
-    fixture_pairs,
-    parse_patch,
-    python_equivalent,
-)
+APP = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, APP)
+
+from analysis import FULL, Analyzer, Maps  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 SQLGLOT = Path(os.environ.get("BR_SQLGLOT", "/sqlglot"))
-MAPS = Path(os.environ.get("BR_MAPS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps.json.gz")))
+MAPS = Path(os.environ.get("BR_MAPS", os.path.join(APP, "maps.json.gz")))
+MODE = os.environ.get("BR_MODE", "run")
+DEADLINE_S = float(os.environ.get("BR_DEADLINE", "140"))
+PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 T0 = time.time()
+
+TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCH_EXEC = "tests/test_executor.py::TestExecutor::test_execute_tpch"
+TPCH_OPT = "tests/test_executor.py::TestExecutor::test_optimized_tpch"
+MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
+GENMEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
+
+# in-container CPU estimates (seconds) for tests whose cost differs from the recorded time
+EST_OVERRIDE = {MAX_NODES: 0.35}
+EXECUTOR_CLASS_SETUP = 0.35
+PER_JOB_OVERHEAD = 0.3
 
 
 def log(*a):
     print(f"[{time.time() - T0:6.2f}]", *a, file=sys.stderr, flush=True)
-
-
-class Maps:
-    def __init__(self, path: Path, tests: list[dict]):
-        with gzip.open(path, "rt") as fh:
-            m = json.load(fh)
-        number_by_id = {t["id"]: t["number"] for t in tests}
-        # translate our test indices into this run's numbers
-        trans = [number_by_id.get(i) for i in m["ids"]]
-        self.sets = [frozenset(trans[i] for i in s if trans[i] is not None) for s in m["sets"]]
-        self.funcs = m["funcs"]
-        self.files = m["files"]
-        self.reads = m["reads"]
-        self.dialects = m["dialects"]
-        self.lines = m["lines"]
-        self.all_numbers = frozenset(t["number"] for t in tests)
-        # tests per test file
-        self.by_test_file: dict[str, set[int]] = {}
-        for t in tests:
-            self.by_test_file.setdefault(t["file"], set()).add(t["number"])
-        self.id_by_number = {t["number"]: t["id"] for t in tests}
-        self.number_by_id = number_by_id
-        # file-level union by directory prefix
-        self.unmapped = frozenset(n for n in self.all_numbers if self.id_by_number[n] not in set(m["ids"]))
-
-    def get(self, table: dict, key) -> frozenset:
-        s = table.get(key)
-        return self.sets[s] if s is not None else frozenset()
-
-    def file_tests(self, path: str) -> frozenset:
-        return self.get(self.files, path)
-
-    def func_tests(self, path: str, firstline: int) -> frozenset:
-        return self.get(self.funcs, f"{path}:{firstline}")
-
-
-# Dialect families: a module-level change in a dialect's files reaches its subclasses too.
-def dialect_name_of(path: str) -> str | None:
-    parts = path.split("/")
-    if len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in (
-        "dialects", "generators", "parsers", "tokenizers", "typing"
-    ):
-        name = parts[2][:-3]
-        if name in ("__init__", "dialect"):
-            return None
-        return name
-    return None
-
-
-def module_level_candidates(maps: Maps, path: str) -> set[int]:
-    cand = set(maps.file_tests(path))
-    name = dialect_name_of(path)
-    if name:
-        # every test that instantiated a dialect defined in a module whose name matches,
-        # plus the files of the same dialect
-        for d in ("dialects", "generators", "parsers", "tokenizers", "typing"):
-            cand |= maps.file_tests(f"sqlglot/{d}/{name}.py")
-        for key, sid in maps.dialects.items():
-            if key.startswith(f"sqlglot.dialects.{name}."):
-                cand |= maps.sets[sid]
-        # subclasses: any dialect whose files import this one show up via file coverage of
-        # the base module when they run, which file_tests already includes
-    else:
-        # a core module: anything that executed code in it
-        pass
-    return cand
-
-
-def analyze_commit(maps: Maps, patch_text: str) -> dict:
-    """Return {'cand': set, 'notes': [...], 'certain': set} for one patch."""
-    cand: set[int] = set()
-    certain: set[int] = set()
-    notes: list[str] = []
-    for f in parse_patch(patch_text):
-        path = f["path"]
-        old_path = f["old"]
-        orig_file = SQLGLOT / old_path if old_path else None
-        try:
-            original = orig_file.read_text(encoding="utf-8") if orig_file and orig_file.exists() else ""
-        except Exception:
-            original = ""
-        patched = apply_hunks(original, f["hunks"]) if f["hunks"] else original
-        if path.startswith("sqlglot/") and path.endswith(".py"):
-            if patched is not None and f["old"] == f["new"] and python_equivalent(original, patched):
-                notes.append(f"{path}: comment-only")
-                continue
-            if patched is not None and not compiles(patched, path):
-                notes.append(f"{path}: syntax error -> everything importing it")
-                c = maps.file_tests(path) | module_level_candidates(maps, path)
-                if not dialect_name_of(path):
-                    c = set(maps.all_numbers)
-                cand |= c
-                certain |= c
-                continue
-            try:
-                idx = FuncIndex(original)
-            except SyntaxError:
-                idx = None
-            for tag, line in changed_old_lines(f["hunks"]):
-                enc = idx.enclosing(line) if idx else None
-                if enc is None and tag == "+" and idx:
-                    # insertion at the start of a block: look at the line before
-                    enc = idx.enclosing(line - 1)
-                    if enc is not None:
-                        # make sure line-1 is really inside the function body
-                        pass
-                if enc is not None:
-                    cand |= maps.func_tests(path, enc[0])
-                    notes.append(f"{path}:{line} func@{enc[0]}")
-                else:
-                    cand |= module_level_candidates(maps, path)
-                    notes.append(f"{path}:{line} module-level")
-        elif path.startswith("tests/fixtures/"):
-            readers = set(maps.get(maps.reads, path))
-            if path.startswith("tests/fixtures/optimizer/tpc-"):
-                readers |= tpc_fixture_tests(maps, path, original, patched)
-            if patched is not None and not path.endswith((".gz", ".json")):
-                try:
-                    same = fixture_pairs(original) == fixture_pairs(patched) and fixture_lines(original) == fixture_lines(patched)
-                    # titles do not change outcomes
-                    if not same:
-                        a = [({k: v for k, v in m.items() if k != "title"}, s, e) for m, s, e in fixture_pairs(original)]
-                        b = [({k: v for k, v in m.items() if k != "title"}, s, e) for m, s, e in fixture_pairs(patched)]
-                        if a == b and fixture_lines(original) == fixture_lines(patched):
-                            same = True
-                except Exception:
-                    same = False
-                if same:
-                    notes.append(f"{path}: fixture no-op")
-                    continue
-            notes.append(f"{path}: fixture readers {len(readers)}")
-            cand |= readers
-            if len(readers) <= 2:
-                certain |= readers
-        elif path.startswith("tests/") and path.endswith(".py"):
-            # a change to test code: the tests of that file (all of them if module level)
-            file_tests = set(maps.by_test_file.get(path, set()))
-            hit = set()
-            try:
-                idx = FuncIndex(original)
-                for tag, line in changed_old_lines(f["hunks"]):
-                    enc = idx.enclosing(line)
-                    if enc is None:
-                        hit = file_tests
-                        break
-                    # find the test method containing it by def line
-                    import ast as _ast
-                    tree = _ast.parse(original)
-                    for node in _ast.walk(tree):
-                        if isinstance(node, _ast.ClassDef):
-                            for item in node.body:
-                                if isinstance(item, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and item.lineno <= line <= item.end_lineno:
-                                    if item.name.startswith("test"):
-                                        tid = f"{path}::{node.name}::{item.name}"
-                                        if tid in maps.number_by_id:
-                                            hit.add(maps.number_by_id[tid])
-                                    else:
-                                        hit = file_tests
-                if not hit:
-                    hit = file_tests
-            except Exception:
-                hit = file_tests
-            if path == "tests/helpers.py" or not file_tests:
-                hit = set(maps.all_numbers)
-            notes.append(f"{path}: test code {len(hit)}")
-            cand |= hit
-        else:
-            readers = set(maps.get(maps.reads, path))
-            notes.append(f"{path}: other file readers {len(readers)}")
-            cand |= readers
-    return {"cand": cand, "certain": certain, "notes": notes}
-
-
-def tpc_fixture_tests(maps: Maps, path: str, original: str, patched: str | None) -> set[int]:
-    res = set()
-    def num(i):
-        return maps.number_by_id.get(i)
-    if "tpc-ds" in path:
-        if path.endswith(".sql"):
-            res |= {num("tests/test_optimizer.py::TestOptimizer::test_tpcds")}
-            res |= {num("tests/test_executor.py::TestExecutor::test_execute_tpcds")}
-        else:
-            res |= {n for n in maps.by_test_file.get("tests/test_executor.py", set())}
-    else:
-        if path.endswith(".sql"):
-            res |= {num("tests/test_optimizer.py::TestOptimizer::test_tpch"),
-                    num("tests/test_executor.py::TestExecutor::test_execute_tpch"),
-                    num("tests/test_executor.py::TestExecutor::test_optimized_tpch")}
-        else:
-            res |= {n for n in maps.by_test_file.get("tests/test_executor.py", set())}
-    res.discard(None)
-    return res
 
 
 def split(numbers, duration_ms: dict[int, int]) -> list[list[int]]:
@@ -244,28 +60,265 @@ def split(numbers, duration_ms: dict[int, int]) -> list[list[int]]:
     return [w for w in best[1] if w]
 
 
+def output_cost(numbers, duration_ms) -> float:
+    ws = split(numbers, duration_ms)
+    if not ws:
+        return 0.0
+    return (max(sum(duration_ms[n] for n in w) for w in ws) + 2000 * len(ws)) / 1000
+
+
+def load_tpcds():
+    import gzip
+    try:
+        with gzip.open(os.path.join(APP, "tpcds.json.gz"), "rt") as fh:
+            d = json.load(fh)
+        return {
+            "phases": d["phases"],
+            "times": {int(k): v for k, v in d["times"].items()},
+            "executed": {int(k) for k in d["hashes"]},
+        }
+    except Exception as e:  # noqa: BLE001
+        log("tpcds data unavailable", repr(e))
+        return None
+
+
+def tpcds_spec(td, touched, plan_items):
+    """Split TPC-DS items by the phase that executes the changed statements."""
+    ph = td["phases"]
+
+    def items(phase):
+        res = set()
+        for rel, lines in touched:
+            fl = ph.get(phase, {}).get(rel)
+            if not fl:
+                continue
+            for l in lines:
+                res.update(fl.get(str(l), ()))
+        return res
+
+    executed = td["executed"]
+    run = items("exec")
+    parse = items("parse")
+    opt = items("optimize")
+    duck = items("duck")
+    known = run | parse | opt | duck
+    run |= (set(plan_items) - known) & executed
+    parse_only = (set(plan_items) - known) - executed
+    spec = {
+        "run": sorted(run),
+        "proxy": sorted(((parse | opt) & executed) - run),
+        "parse": sorted((parse - executed) | parse_only),
+        "duck": sorted(duck - run),
+    }
+    t = td["times"]
+    est = (sum(t.get(i, {}).get("exec", 0.3) for i in spec["run"]) + 0.04 * len(spec["proxy"])
+           + 0.012 * len(spec["duck"]) + 0.005 * len(spec["parse"]) + 0.05)
+    return spec, est
+
+
+def dialects_for(files: dict, dialect_files: dict) -> list[str] | None:
+    """Dialects whose class hierarchy includes a changed module (None = all)."""
+    res = set()
+    for rel in files:
+        if not rel.startswith("sqlglot/"):
+            continue
+        hit = [d for d, fs in dialect_files.items() if rel in fs]
+        if len(hit) == len(dialect_files) or not hit:
+            return None
+        res |= set(hit)
+    return sorted(res)
+
+
+def choose_split(cand, ests, seconds, duration_ms, maps, likely):
+    """Pick which candidates to run (the rest are listed without running) to minimise
+    estimated CPU + listed cost. Tests whose run cost is high relative to their recorded
+    time are listed first."""
+    order = sorted(cand, key=lambda t: (-(1.0 if t in likely else 0.0),
+                                        -(ests[t] + 0.01) / (seconds[t] + 0.01)))
+    n = len(order)
+    ks = sorted({0, n} | {min(n, 2 ** i) for i in range(0, 12)} | {k for k in range(0, min(n, 12) + 1)})
+    best = None
+    for k in ks:
+        blind = set(order[:k])
+        run = order[k:]
+        c = output_cost(blind, duration_ms)
+        if run:
+            c += sum(ests[t] for t in run) + PER_JOB_OVERHEAD
+            if any(maps.id_by_number[t].startswith("tests/test_executor.py::") for t in run):
+                c += EXECUTOR_CLASS_SETUP
+        if best is None or c < best[0] - 1e-9:
+            best = (c, k, blind)
+    c, k, blind = best
+    if k == n:
+        return "blind", set(cand), 0.0
+    mode = "run" if k == 0 else "mixed"
+    run_est = c - output_cost(blind, duration_ms)
+    return mode, blind, run_est
+
+
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     duration_ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
+    seconds = {t["number"]: t["seconds"] for t in tests}
     maps = Maps(MAPS, tests)
+    analyzer = Analyzer(maps, SQLGLOT)
+    td = load_tpcds()
+    try:
+        with open(os.path.join(APP, "cpu_est.json")) as fh:
+            cpu_est = json.load(fh)
+    except Exception:  # noqa: BLE001
+        cpu_est = {}
     log("maps loaded")
     patches = sorted((DATA / "commits").glob("*.patch"))
-    out = []
+    plans = {}
     for p in patches:
         commit = p.name[: -len(".patch")]
+        text = p.read_text(encoding="utf-8", errors="replace")
         try:
-            res = analyze_commit(maps, p.read_text(encoding="utf-8", errors="replace"))
-            sel = res["cand"] | set(maps.unmapped & res["cand"])
-            log(commit, len(sel), res["notes"][:4])
+            plan, notes, files = analyzer.analyze(text)
         except Exception as e:  # never fail the run: fall back to everything
             log(commit, "analysis failed", repr(e))
-            sel = set(maps.all_numbers)
-        sel &= maps.all_numbers
-        out.append(json.dumps({"commit": commit, "workers": split(sel, duration_ms)}))
-    sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+            plan, notes, files = {n: FULL for n in maps.all_numbers}, ["failed"], None
+        plan = {t: v for t, v in plan.items() if t in maps.all_numbers}
+        cand = set(plan)
+        blind_cost = output_cost(cand, duration_ms)
+        likely = {t for t, v in plan.items() if isinstance(v, dict) and v.get("pairs")
+                  and v.get("file", "").startswith("tests/fixtures/optimizer/")
+                  and "tpc-" not in v.get("file", "")}
+        specs = {}
+        ests = {}
+        run_est = 0.0
+        has_exec = False
+        for t, v in plan.items():
+            tid = maps.id_by_number[t]
+            spec = {}
+            frac = 1.0
+            if isinstance(v, set):
+                spec["pool"] = sorted(v)
+                n_items = maps.items_count.get(t)
+                if n_items:
+                    frac = min(1.0, len(v) / n_items)
+                    if not tid.startswith("tests/test_executor.py::"):
+                        spec["expect_items"] = n_items
+            elif isinstance(v, dict):
+                spec["pairs"] = sorted(v["pairs"])
+                spec["lines"] = sorted(v["lines"])
+                spec["file"] = v["file"]
+                frac = 0.2
+            est = cpu_est.get(tid, seconds[t]) * frac + 0.002
+            if tid in EST_OVERRIDE:
+                est = EST_OVERRIDE[tid]
+            if tid == MAX_NODES:
+                spec["replica"] = "max_nodes"
+            if tid == GENMEM:
+                ds = dialects_for(files or {}, maps.dialect_files)
+                if ds is not None:
+                    spec["dialects"] = ds
+                est = 2.2 * (len(ds) / len(maps.dialect_files) if ds is not None else 1.0)
+            if tid == TPCDS:
+                gate = [maps.id_by_number[o] for o in plan if o != t and (
+                    maps.id_by_number[o].startswith("tests/test_executor.py::")
+                    or maps.id_by_number[o].split("::")[-1] in ("test_tpcds", "test_tpch", "test_optimize"))]
+                if td is not None and isinstance(v, set) and not analyzer.nonlocal_change:
+                    tspec, est = tpcds_spec(td, analyzer.touched, v)
+                    spec = {"tpcds": tspec, "gate": gate}
+                else:
+                    idxs = spec.get("pool")
+                    if spec.get("pairs") is not None:
+                        idxs = spec["pairs"]
+                    if idxs is None and td is not None:
+                        idxs = sorted(td["executed"])
+                    times = td["times"] if td is not None else {}
+                    est = sum(times.get(i, {}).get("exec", 0.3) + times.get(i, {}).get("parse", 0.005)
+                              for i in (idxs or [])) + 0.1 if idxs is not None else 12.5
+                    spec["gate"] = gate
+            if tid.startswith("tests/test_executor.py::"):
+                has_exec = True
+            specs[tid] = spec
+            ests[t] = est
+            run_est += est
+        if has_exec:
+            run_est += EXECUTOR_CLASS_SETUP
+        mode = "blind"
+        blind_part = set(cand)
+        if MODE == "run" and files is not None and cand:
+            mode, blind_part, run_est = choose_split(cand, ests, seconds, duration_ms, maps, likely)
+            for t in blind_part:
+                specs.pop(maps.id_by_number[t], None)
+        plans[commit] = {"cand": cand, "specs": specs, "files": files, "mode": mode,
+                         "run_est": run_est, "blind_cost": blind_cost, "blind_part": blind_part}
+        log(commit, mode, f"cand={len(cand)} est={run_est:.2f} blind={blind_cost:.2f}", notes[:3])
+
+    jobs = []
+    for c, pl in plans.items():
+        if pl["mode"] not in ("run", "mixed"):
+            continue
+        items = []
+        for tid, spec in sorted(pl["specs"].items()):
+            n = maps.number_by_id[tid]
+            limit = max(4.0, 6 * seconds[n] + 3)
+            if spec.get("replica"):
+                limit = 20.0
+            items.append((tid, limit, spec))
+        jobs.append((c, pl["files"], items))
+    results = {}
+    if jobs:
+        import runner
+
+        runner.prepare_parent(heavy=True)
+        if any(tid.startswith("tests/test_executor.py::") for _, _, items in jobs for tid, _, _ in items):
+            runner.preload_executor_data()
+        log("parent ready", len(jobs), "jobs")
+        # longest first keeps both cores busy
+        jobs.sort(key=lambda j: -plans[j[0]]["run_est"])
+        results = runner.run_all(jobs, parallel=PARALLEL, deadline=T0 + DEADLINE_S)
+
+    out = []
+    total_est = 0.0
+    for c, pl in plans.items():
+        if pl["mode"] in ("run", "mixed"):
+            r = results.get(c)
+            ran = {maps.number_by_id[tid] for tid in pl["specs"]}
+            if r is None:
+                sel = set(pl["cand"])
+            else:
+                failed = {maps.number_by_id[t] for t in r["failed"] if t in maps.number_by_id}
+                passed = {maps.number_by_id[t] for t in r["passed"] if t in maps.number_by_id}
+                unknown = ran - passed - failed
+                sel = failed | unknown | (pl["cand"] - ran)
+                total_est += pl["run_est"]
+                log(c, f"est {pl['run_est']:.2f} cpu {r.get('cpu') or 0:.2f} wall {r['seconds']:.2f} "
+                       f"failed {len(failed)} unknown {len(unknown)}", [n for n in r["notes"] if not n.startswith("NOTE t ")][:3])
+                if os.environ.get("BR_VERBOSE"):
+                    tl = sorted(((float(n.split()[-1]), n.split()[2]) for n in r["notes"] if n.startswith("NOTE t ")), reverse=True)
+                    log("   slowest", [(round(a, 2), b.split("::")[-1]) for a, b in tl[:6]])
+        else:
+            sel = set(pl["cand"])
+        out.append(json.dumps({"commit": c, "workers": split(sel, duration_ms)}))
+    data = "\n".join(out) + ("\n" if out else "")
+    sys.stdout._br_written = True
+    sys.stdout.write(data)
     sys.stdout.flush()
     log("done")
 
 
+def fallback() -> None:
+    """Last resort if anything above failed: every test on every commit."""
+    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    duration_ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
+    ws = split([t["number"] for t in tests], duration_ms)
+    lines = [json.dumps({"commit": p.name[: -len(".patch")], "workers": ws})
+             for p in sorted((DATA / "commits").glob("*.patch"))]
+    sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
+    sys.stdout.flush()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as e:  # noqa: BLE001
+        import traceback
+
+        traceback.print_exc()
+        if not getattr(sys.stdout, "_br_written", False):
+            fallback()

@@ -1,0 +1,530 @@
+"""Static analysis of a patch against the coverage map: which tests (and which of their
+fixture items) can observe the change."""
+from __future__ import annotations
+
+import ast
+import gzip
+import json
+import os
+import re
+from pathlib import Path
+
+from patchutil import (
+    none_compare_equivalent,
+    apply_hunks,
+    changed_old_lines,
+    compiles,
+    fixture_lines,
+    fixture_pairs,
+    parse_patch,
+    python_equivalent,
+)
+
+FULL = None  # plan value meaning "the whole test"
+
+
+def merge_into(plan: dict, add: dict) -> None:
+    for t, items in add.items():
+        if t in plan:
+            cur = plan[t]
+            if cur is FULL or items is FULL:
+                plan[t] = FULL
+            else:
+                plan[t] = cur | items
+        else:
+            plan[t] = FULL if items is FULL else set(items)
+
+
+def full_plan(tests) -> dict:
+    return {t: FULL for t in tests}
+
+
+class Maps:
+    def __init__(self, path: Path, tests: list[dict]):
+        with gzip.open(path, "rt") as fh:
+            m = json.load(fh)
+        self.number_by_id = {t["id"]: t["number"] for t in tests}
+        self.id_by_number = {t["number"]: t["id"] for t in tests}
+        self.trans = [self.number_by_id.get(i) for i in m["ids"]]
+        self.raw_sets = m["sets"]
+        self._tsets = {}
+        self.lines = m["lines"]
+        self.funcs = m["funcs"]
+        self.reads = m["reads"]
+        self.classes = m["classes"]
+        self.items_count = {self.trans[int(k)]: v for k, v in m["items"].items() if self.trans[int(k)] is not None}
+        self.import_lines = {f: set(v) for f, v in m["import_lines"].items()}
+        self.dialect_files = m["dialect_files"]
+        self.all_numbers = frozenset(self.number_by_id.values())
+        self.by_test_file: dict[str, set[int]] = {}
+        for t in tests:
+            self.by_test_file.setdefault(t["file"], set()).add(t["number"])
+        mapped = set(m["ids"])
+        self.unmapped = frozenset(n for i, n in self.number_by_id.items() if i not in mapped)
+
+    def tests_of(self, sid: int) -> frozenset:
+        s = self._tsets.get(sid)
+        if s is None:
+            s = frozenset(self.trans[i] for i in self.raw_sets[sid] if self.trans[i] is not None)
+            self._tsets[sid] = s
+        return s
+
+    def items_of(self, sid: int) -> set:
+        return set(self.raw_sets[sid])
+
+    def cover_lines(self, path: str, lines) -> dict:
+        """Plan of tests that executed any of the lines (with item subsets where known)."""
+        plan: dict = {}
+        fl = self.lines.get(path)
+        if not fl:
+            return plan
+        for l in lines:
+            e = fl.get(str(l))
+            if not e:
+                continue
+            glob = self.tests_of(e[1])
+            itemmap = e[2] if len(e) > 2 else {}
+            for t in self.tests_of(e[0]):
+                if t in glob:
+                    plan[t] = FULL
+            for tidx, sid in itemmap.items():
+                t = self.trans[int(tidx)]
+                if t is None or plan.get(t, 0) is FULL:
+                    continue
+                plan.setdefault(t, set()).update(self.items_of(sid))
+            # tests in "all" but neither glob nor item-resolved (should not happen): full
+            for t in self.tests_of(e[0]):
+                if t not in plan:
+                    plan[t] = FULL
+        return plan
+
+    def executed_at_runtime(self, path: str, line: int) -> bool:
+        fl = self.lines.get(path)
+        return bool(fl and str(line) in fl)
+
+    def file_tests(self, path: str) -> set:
+        fl = self.lines.get(path) or {}
+        res = set()
+        seen = set()
+        for e in fl.values():
+            if e[0] not in seen:
+                seen.add(e[0])
+                res |= self.tests_of(e[0])
+        return res
+
+    def class_tests(self, key: str):
+        sid = self.classes.get(key)
+        return None if sid is None else self.tests_of(sid)
+
+    def read_tests(self, path: str) -> set:
+        sid = self.reads.get(path)
+        return set() if sid is None else set(self.tests_of(sid))
+
+
+# ---------------------------------------------------------------- source index
+
+class SrcIndex:
+    def __init__(self, src: str):
+        self.tree = ast.parse(src)
+        self.funcs = []    # (body_start, end, node)
+        self.lambdas = []  # (start, end, node)
+        self.classes = []  # (start, end, node, qualname)
+        self.parent = {}
+
+        def visit(node, qual):
+            for child in ast.iter_child_nodes(node):
+                self.parent[child] = node
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    self.funcs.append((child.body[0].lineno, child.end_lineno, child))
+                    visit(child, qual + [child.name, "<locals>"])
+                elif isinstance(child, ast.ClassDef):
+                    self.classes.append((child.lineno, child.end_lineno, child, ".".join(qual + [child.name])))
+                    visit(child, qual + [child.name])
+                elif isinstance(child, ast.Lambda):
+                    self.lambdas.append((child.lineno, child.end_lineno, child))
+                    visit(child, qual)
+                else:
+                    visit(child, qual)
+
+        visit(self.tree, [])
+
+    def innermost(self, items, line):
+        best = None
+        for it in items:
+            if it[0] <= line <= it[1] and (best is None or it[0] >= best[0]):
+                best = it
+        return best
+
+    def stmt_in(self, body, line):
+        """Innermost statement within a list of statements containing line (recursive)."""
+        for st in body:
+            if st.lineno <= line <= st.end_lineno:
+                # descend into compound bodies
+                for field in ("body", "orelse", "finalbody", "handlers", "cases"):
+                    sub = getattr(st, field, None)
+                    if not sub:
+                        continue
+                    if field == "handlers":
+                        for h in sub:
+                            if h.body and h.body[0].lineno <= line <= h.end_lineno:
+                                r = self.stmt_in(h.body, line)
+                                if r is not None:
+                                    return r
+                    elif field == "cases":
+                        for c in sub:
+                            if c.body and c.body[0].lineno <= line <= c.end_lineno:
+                                r = self.stmt_in(c.body, line)
+                                if r is not None:
+                                    return r
+                    elif isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                        if sub[0].lineno <= line <= sub[-1].end_lineno:
+                            r = self.stmt_in(sub, line)
+                            if r is not None:
+                                return r
+                return st
+        return None
+
+    def locate(self, line: int) -> dict:
+        lam = self.innermost(self.lambdas, line)
+        fn = self.innermost(self.funcs, line)
+        # a decorator/signature line belongs to the def statement, not its body
+        if lam is not None and (fn is None or lam[0] >= fn[0]):
+            return {"kind": "func", "lines": range(lam[0], lam[1] + 1)}
+        if fn is not None:
+            node = fn[2]
+            st = self.stmt_in(node.body, line)
+            if st is None:
+                return {"kind": "none"}
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if line < (st.body[0].lineno if st.body else st.end_lineno + 1):
+                    # nested def header: executed when the outer function runs
+                    first = min([st.lineno] + [d.lineno for d in st.decorator_list])
+                    return {"kind": "stmt", "lines": range(first, st.body[0].lineno)}
+            return {"kind": "stmt", "lines": range(st.lineno, st.end_lineno + 1)}
+        # not inside any function body: maybe a def header (decorators/signature)
+        for node in ast.walk(self.tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                if first <= line < node.body[0].lineno:
+                    return {"kind": "funcdef", "lines": range(node.body[0].lineno, node.end_lineno + 1),
+                            "first": first, "node": node}
+        cls = self.innermost(self.classes, line)
+        if cls is not None:
+            node = cls[2]
+            st = self.stmt_in(node.body, line) if node.body and node.body[0].lineno <= line else None
+            return {"kind": "class", "qualname": cls[3], "stmt": st, "node": node}
+        st = self.stmt_in(self.tree.body, line)
+        return {"kind": "module", "stmt": st}
+
+
+def assigned_names(st) -> list[str]:
+    names = []
+    if isinstance(st, ast.Assign):
+        targets = st.targets
+    elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
+        targets = [st.target]
+    elif isinstance(st, (ast.Import, ast.ImportFrom)):
+        return [(a.asname or a.name).split(".")[0] for a in st.names]
+    else:
+        return []
+    for t in targets:
+        for n in ast.walk(t):
+            if isinstance(n, ast.Name):
+                names.append(n.id)
+            elif isinstance(n, ast.Attribute):
+                names.append(n.attr)
+    return names
+
+
+class Analyzer:
+    def __init__(self, maps: Maps, root: Path):
+        self.maps = maps
+        self.root = root
+        self._src = {}
+        self._idx = {}
+        self._all_sources = None
+        self.touched = []      # [(rel, lines)] statement-level changes of the last analyze()
+        self.nonlocal_change = False
+
+    def source(self, rel: str) -> str:
+        if rel not in self._src:
+            p = self.root / rel
+            self._src[rel] = p.read_text(encoding="utf-8") if p.exists() else ""
+        return self._src[rel]
+
+    def index(self, rel: str):
+        if rel not in self._idx:
+            try:
+                self._idx[rel] = SrcIndex(self.source(rel))
+            except SyntaxError:
+                self._idx[rel] = None
+        return self._idx[rel]
+
+    def all_sources(self):
+        if self._all_sources is None:
+            res = []
+            for p in sorted((self.root / "sqlglot").rglob("*.py")):
+                rel = str(p.relative_to(self.root))
+                res.append((rel, self.source(rel)))
+            self._all_sources = res
+        return self._all_sources
+
+    # ---- name references ---------------------------------------------------
+    def name_refs(self, names, def_path, def_lines):
+        """Plan for runtime references to the names, or None when some reference runs at
+        import time (class bodies, metaclasses, module level) and refinement is unsafe."""
+        plan: dict = {}
+        pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in set(names)) + r")\b")
+        def_lines = set(def_lines)
+        for rel, src in self.all_sources():
+            if not pat.search(src):
+                continue
+            imp = self.maps.import_lines.get(rel, set())
+            for i, text in enumerate(src.split("\n"), start=1):
+                if rel == def_path and i in def_lines:
+                    continue
+                if not pat.search(text):
+                    continue
+                if text.lstrip().startswith("#"):
+                    continue
+                idx = self.index(rel)
+                if idx is None:
+                    return None
+                loc = idx.locate(i)
+                if loc["kind"] == "class" and _is_plain_override(loc.get("stmt"), names):
+                    continue
+                if i in imp:
+                    return None
+                if loc["kind"] in ("class", "module", "funcdef"):
+                    return None
+                if loc["kind"] == "none":
+                    continue
+                merge_into(plan, self.maps.cover_lines(rel, loc["lines"]))
+        return plan
+
+    def dialect_users(self, rel: str) -> dict:
+        plan = {}
+        mod = rel[:-3].replace("/", ".")
+        for key, sid in self.maps.classes.items():
+            if key.startswith(mod + ":"):
+                merge_into(plan, full_plan(self.maps.tests_of(sid)))
+        return plan
+
+    def module_fallback(self, rel: str) -> dict:
+        plan = full_plan(self.maps.file_tests(rel))
+        merge_into(plan, self.dialect_users(rel))
+        return plan
+
+    # ---- per change -----------------------------------------------------------
+    def py_change(self, rel: str, original: str, patched: str | None, hunks) -> tuple[dict, list]:
+        notes = []
+        if patched is not None and python_equivalent(original, patched):
+            return {}, [f"{rel}: comment-only"]
+        if patched is not None and rel != "sqlglot/executor/env.py" and none_compare_equivalent(original, patched):
+            return {}, [f"{rel}: None-comparison swap (equivalent)"]
+        if patched is None or not compiles(patched, rel):
+            self.nonlocal_change = True
+            notes.append(f"{rel}: does not apply/compile")
+            plan = self.module_fallback(rel)
+            if not any(seg in rel for seg in ("/dialects/", "/generators/", "/parsers/", "/tokenizers/", "/typing/")):
+                plan = full_plan(self.maps.all_numbers)
+            return plan, notes
+        idx = self.index(rel)
+        if idx is None:
+            return self.module_fallback(rel), [f"{rel}: original unparsable"]
+        plan: dict = {}
+        for tag, line in changed_old_lines(hunks):
+            locs = [idx.locate(line)]
+            if tag == "+":
+                locs.append(idx.locate(line - 1))
+            for loc in locs:
+                kind = loc["kind"]
+                if kind in ("func", "stmt", "funcdef"):
+                    merge_into(plan, self.maps.cover_lines(rel, loc["lines"]))
+                    self.touched.append((rel, list(loc["lines"])))
+                    notes.append(f"{rel}:{line} {kind}")
+                elif kind == "none":
+                    continue
+                elif kind == "class":
+                    self.nonlocal_change = True
+                    merge_into(plan, self.class_change(rel, loc, line))
+                    notes.append(f"{rel}:{line} class {loc['qualname']}")
+                else:
+                    self.nonlocal_change = True
+                    merge_into(plan, self.module_change(rel, loc, line))
+                    notes.append(f"{rel}:{line} module")
+        return plan, notes
+
+    def class_change(self, rel, loc, line) -> dict:
+        mod = rel[:-3].replace("/", ".")
+        key = f"{mod}:{loc['qualname']}"
+        inst = self.maps.class_tests(key)
+        if inst is None:
+            return self.module_fallback(rel)
+        st = loc["stmt"]
+        names = assigned_names(st) if st is not None else []
+        if names:
+            refs = self.name_refs(names, rel, range(st.lineno, st.end_lineno + 1))
+            if refs is not None:
+                return {t: v for t, v in refs.items() if t in inst}
+        return full_plan(inst)
+
+    def module_change(self, rel, loc, line) -> dict:
+        st = loc["stmt"]
+        names = assigned_names(st) if st is not None else []
+        if names:
+            refs = self.name_refs(names, rel, range(st.lineno, st.end_lineno + 1))
+            if refs is not None:
+                return refs
+        if st is None:
+            return {}
+        return self.module_fallback(rel)
+
+    def fixture_change(self, rel, original, patched) -> tuple[dict, list]:
+        readers = self.maps.read_tests(rel)
+        notes = []
+        if patched is None:
+            return full_plan(readers | self.tpc_readers(rel)), [f"{rel}: fixture patch failed"]
+        if rel.endswith(".sql"):
+            try:
+                a_pairs, b_pairs = fixture_pairs(original), fixture_pairs(patched)
+                a_lines, b_lines = fixture_lines(original), fixture_lines(patched)
+            except Exception:
+                return full_plan(readers | self.tpc_readers(rel)), [f"{rel}: fixture parse failed"]
+
+            def strip(pairs):
+                return [({k: v for k, v in m.items() if k != "title"}, s, e) for m, s, e in pairs]
+
+            changed_pairs = diff_indices(strip(a_pairs), strip(b_pairs))
+            changed_titles = diff_indices(a_pairs, b_pairs)
+            changed_lines = diff_indices(a_lines, b_lines)
+            if not changed_pairs and not changed_lines:
+                return {}, [f"{rel}: fixture no-op"]
+            plan = {}
+            idx_pairs = set(changed_pairs) | set(changed_titles)
+            for t in readers | self.tpc_readers(rel):
+                tid = self.maps.id_by_number[t]
+                # which loader the test uses decides the indexing; record both
+                plan[t] = {"pairs": idx_pairs, "lines": set(changed_lines), "file": rel}
+            notes.append(f"{rel}: fixture items pairs={sorted(idx_pairs)[:5]} lines={sorted(changed_lines)[:5]}")
+            return plan, notes
+        return full_plan(readers | self.tpc_readers(rel)), [f"{rel}: data file"]
+
+    def tpc_readers(self, rel) -> set:
+        res = set()
+        n = self.maps.number_by_id.get
+        if "tpc-ds" in rel:
+            if rel.endswith(".sql"):
+                res |= {n("tests/test_optimizer.py::TestOptimizer::test_tpcds"),
+                        n("tests/test_executor.py::TestExecutor::test_execute_tpcds")}
+            else:
+                res |= self.maps.by_test_file.get("tests/test_executor.py", set())
+        elif "tpc-h" in rel:
+            if rel.endswith(".sql"):
+                res |= {n("tests/test_optimizer.py::TestOptimizer::test_tpch"),
+                        n("tests/test_executor.py::TestExecutor::test_execute_tpch"),
+                        n("tests/test_executor.py::TestExecutor::test_optimized_tpch")}
+            else:
+                res |= self.maps.by_test_file.get("tests/test_executor.py", set())
+        res.discard(None)
+        return res
+
+    def test_code_change(self, rel, original, hunks) -> tuple[dict, list]:
+        file_tests = set(self.maps.by_test_file.get(rel, set()))
+        if rel == "tests/helpers.py" or not file_tests:
+            return full_plan(self.maps.all_numbers if rel.endswith("helpers.py") else file_tests), [f"{rel}: test support"]
+        hit = set()
+        try:
+            tree = ast.parse(original)
+            methods = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            methods.append((item, node.name))
+            for tag, line in changed_old_lines(hunks):
+                owner = None
+                for item, cname in methods:
+                    first = min([item.lineno] + [d.lineno for d in item.decorator_list])
+                    if first <= line <= item.end_lineno:
+                        owner = (item, cname)
+                if owner and owner[0].name.startswith("test"):
+                    tid = f"{rel}::{owner[1]}::{owner[0].name}"
+                    if tid in self.maps.number_by_id:
+                        hit.add(self.maps.number_by_id[tid])
+                        continue
+                hit = file_tests
+                break
+        except SyntaxError:
+            hit = file_tests
+        return full_plan(hit), [f"{rel}: test code {len(hit)}"]
+
+    def analyze(self, patch_text: str) -> tuple[dict, list, dict]:
+        self.touched = []
+        self.nonlocal_change = False
+        plan: dict = {}
+        notes: list = []
+        files = {}
+        ok_overlay = True
+        for f in parse_patch(patch_text):
+            rel = f["path"]
+            old = f["old"]
+            original = self.source(old) if old else ""
+            patched = apply_hunks(original, f["hunks"]) if f["hunks"] else original
+            if f["old"] != f["new"] or patched is None:
+                ok_overlay = False
+            else:
+                files[rel] = patched
+            if rel.startswith("sqlglot/") and rel.endswith(".py"):
+                p, n = self.py_change(rel, original, patched, f["hunks"])
+            elif rel.startswith("tests/fixtures/"):
+                p, n = self.fixture_change(rel, original, patched)
+                if p:
+                    self.nonlocal_change = True
+            elif rel.startswith("tests/") and rel.endswith(".py"):
+                self.nonlocal_change = True
+                p, n = self.test_code_change(rel, original, f["hunks"])
+            else:
+                self.nonlocal_change = True
+                p, n = full_plan(self.maps.read_tests(rel)), [f"{rel}: other file"]
+            merge_into_plan_any(plan, p)
+            notes += n
+        return plan, notes, (files if ok_overlay else None)
+
+
+def merge_into_plan_any(plan, add):
+    """Merge plans whose item values may be sets (pool items) or dicts (fixture items)."""
+    for t, v in add.items():
+        cur = plan.get(t, "missing")
+        if cur == "missing":
+            plan[t] = v
+        elif cur is FULL or v is FULL:
+            plan[t] = FULL
+        elif isinstance(cur, set) and isinstance(v, set):
+            plan[t] = cur | v
+        else:
+            plan[t] = FULL  # mixing kinds: run the whole test
+
+
+def diff_indices(a, b) -> list[int]:
+    n = min(len(a), len(b))
+    res = [i for i in range(n) if a[i] != b[i]]
+    if len(a) != len(b):
+        res += list(range(n, max(len(a), len(b))))
+    return res
+
+
+def _is_plain_override(st, names) -> bool:
+    """A class-body assignment that rebinds one of the names without reading any of them."""
+    if not isinstance(st, (ast.Assign, ast.AnnAssign)):
+        return False
+    targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+    tnames = {t.id for t in targets if isinstance(t, ast.Name)}
+    if not tnames or not tnames & set(names):
+        return False
+    value = st.value
+    if value is None:
+        return True
+    used = {n.id for n in ast.walk(value) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(value) if isinstance(n, ast.Attribute)}
+    return not used & set(names)
