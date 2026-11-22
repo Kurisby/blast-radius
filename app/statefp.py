@@ -37,16 +37,11 @@ def keyname(k):
 _ATOMS = (int, float, complex, str, bytes, bool, type(None))
 
 
-class StaleRef(Exception):
-    """The state reached an object left over from before a re-import."""
-
-
 class _Hasher:
-    def __init__(self, stale=None):
+    def __init__(self):
         self.memo = {}
         self.stack = set()
         self.types = []
-        self.stale = stale or ()
 
     def h(self, v) -> str:
         t = type(v)
@@ -56,8 +51,6 @@ class _Hasher:
         r = self.memo.get(i)
         if r is not None:
             return r[1]
-        if i in self.stale:
-            raise StaleRef(repr(v)[:80])
         if i in self.stack:
             return "@"
         self.stack.add(i)
@@ -144,12 +137,11 @@ def import_all():
     return errors
 
 
-def fingerprint(stale=None) -> dict:
+def fingerprint() -> dict:
     """{path: hash} for module globals ("mod:name") and own class attributes
-    ("mod:Qual.attr"); dict-valued entries map to {"*": hash, "k": {keyname: hash}}.
-    `stale`: ids of objects that must not be reachable (StaleRef otherwise)."""
+    ("mod:Qual.attr"); dict-valued entries map to {"*": hash, "k": {keyname: hash}}."""
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
-    hs = _Hasher(stale)
+    hs = _Hasher()
     out = {}
     done = set()
 
@@ -234,98 +226,6 @@ def diff(a: dict, b: dict) -> list:
     return res
 
 
-def _result(errors, fp, orig):
-    return {"errors": errors, "diff": diff(orig["fp"], fp), "orig_errors": orig.get("errors", []),
-            "unstable": orig.get("unstable", [])}
-
-
-def _sqlglot_modules():
-    return [n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")]
-
-
-def _stale_objects():
-    """Every class and function the current sqlglot modules define (kept alive so that
-    their ids stay unique)."""
-    keep = []
-    seen = set()
-
-    def own(v):
-        m = getattr(v, "__module__", None)
-        return isinstance(m, str) and (m == "sqlglot" or m.startswith("sqlglot."))
-
-    def add_class(c):
-        if id(c) in seen:
-            return
-        seen.add(id(c))
-        keep.append(c)
-        for v in list(vars(c).values()):
-            if isinstance(v, (classmethod, staticmethod)):
-                v = v.__func__
-            if isinstance(v, type) and own(v):
-                add_class(v)
-            elif isinstance(v, types.FunctionType) and own(v):
-                keep.append(v)
-
-    for name in _sqlglot_modules():
-        mod = sys.modules.get(name)
-        if mod is None:
-            continue
-        keep.append(mod.__dict__)
-        for v in list(vars(mod).values()):
-            if isinstance(v, type) and own(v):
-                add_class(v)
-            elif isinstance(v, types.FunctionType) and own(v):
-                keep.append(v)
-    return keep
-
-
-def serve(orig_path, root):
-    """Fork server (run under the fixed hash seed): import every sqlglot module once, then
-    answer one request line {"overlay": DIR, "out": PATH} at a time. A forked child drops
-    every sqlglot module, installs the overlay, imports everything again and writes what
-    main() would write; old classes and functions must not be reachable from the new state.
-    Replies "ok" or "fail" per request. Saves a process start and the teardown per diff."""
-    import gc
-    import os
-
-    import br_overlay
-
-    import_all()
-    with open(orig_path) as fh:
-        orig = json.load(fh)
-    gc.collect()
-    gc.freeze()
-    for line in sys.stdin:
-        req = json.loads(line)
-        pid = os.fork()
-        if pid == 0:
-            code = 3
-            try:
-                gc.disable()
-                keep = _stale_objects()
-                stale = {id(x) for x in keep}
-                for name in _sqlglot_modules():
-                    del sys.modules[name]
-                if req.get("overlay"):
-                    br_overlay.install(root, req["overlay"])
-                errors = import_all()
-                fp = fingerprint(stale)
-                with open(req["out"], "w") as fh:
-                    json.dump(_result(errors, fp, orig), fh)
-                code = 0
-            except StaleRef:
-                code = 2
-            except BaseException:  # noqa: BLE001
-                code = 3
-            finally:
-                os._exit(code)
-        _, status = os.waitpid(pid, 0)
-        ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-        sys.stdout.write(("ok" if ok else f"fail {status}") + "\n")
-        sys.stdout.flush()
-    os._exit(0)
-
-
 def main():
     """python statefp.py OUT.json [ORIG.json]: write the fingerprint, or with ORIG the diff
     (ORIG's "unstable" paths, which differ between two runs of the pinned commit, are kept
@@ -335,7 +235,8 @@ def main():
     if len(sys.argv) > 2:
         with open(sys.argv[2]) as fh:
             orig = json.load(fh)
-        res = _result(errors, fp, orig)
+        res = {"errors": errors, "diff": diff(orig["fp"], fp), "orig_errors": orig.get("errors", []),
+               "unstable": orig.get("unstable", [])}
     else:
         res = {"errors": errors, "fp": fp}
     with open(sys.argv[1], "w") as fh:

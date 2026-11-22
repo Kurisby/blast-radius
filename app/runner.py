@@ -388,75 +388,6 @@ def dump_state_fp(path: str) -> None:
         json.dump({"errors": outs[0]["errors"], "fp": a, "unstable": unstable}, fh, separators=(",", ":"))
 
 
-_STATEFP_SERVER_CODE = r"""
-import os, sys
-sys.path.insert(0, os.environ["BR_HOOK"])
-sys.path.insert(0, os.environ["BR_ROOT"])
-sys.path.insert(0, os.environ["BR_APP"])
-import statefp
-statefp.serve(sys.argv[1], os.environ["BR_ROOT"])
-"""
-
-FP_SERVER = os.environ.get("BR_FPSERVER", "1") == "1"
-FP_CHECK = os.environ.get("BR_STATEFP_CHECK") == "1"  # local test: compare with a fresh process
-_FP = [None]  # the fork server process, or False once it is unusable
-
-
-def fp_server_stop(kill: bool = False) -> None:
-    s = _FP[0]
-    if not s:
-        return
-    _FP[0] = False
-    try:
-        if kill:
-            os.killpg(s.pid, signal.SIGKILL)
-        else:
-            s.stdin.close()
-        s.wait(timeout=5)
-    except Exception:  # noqa: BLE001
-        try:
-            os.killpg(s.pid, signal.SIGKILL)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _fp_server_diff(d: str, out: str, orig: str, timeout: float):
-    """State diff through the fork server: the result dict, or None (then a fresh process)."""
-    import json
-    import subprocess
-
-    if _FP[0] is False:
-        return None
-    if _FP[0] is None:
-        try:
-            _FP[0] = subprocess.Popen([sys.executable, "-c", _STATEFP_SERVER_CODE, orig], cwd=ROOT,
-                                      env=_statefp_env(None), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL, text=True, start_new_session=True)
-            import atexit
-
-            atexit.register(fp_server_stop)
-        except Exception as e:  # noqa: BLE001
-            log("fp server failed to start", repr(e))
-            _FP[0] = False
-            return None
-    s = _FP[0]
-    try:
-        s.stdin.write(json.dumps({"overlay": d, "out": out}) + "\n")
-        s.stdin.flush()
-        r, _, _ = select.select([s.stdout], [], [], timeout + 2.0)
-        reply = s.stdout.readline().strip() if r else "timeout"
-    except Exception as e:  # noqa: BLE001
-        reply = f"error {e!r}"
-    if reply != "ok":
-        log("fp server", reply)
-        if not reply.startswith("fail"):
-            fp_server_stop(kill=True)
-            _FP[0] = False
-        return None
-    with open(out) as fh:
-        return json.load(fh)
-
-
 def state_diff(key: str, files: dict, timeout: float = 8.0):
     """Import-time state of the tree with `files` patched in, compared with the pinned
     commit's: {"diff": [(path, kind, info)], "errors": [...], ...} or None."""
@@ -469,18 +400,10 @@ def state_diff(key: str, files: dict, timeout: float = 8.0):
     d = write_overlay("fp-" + key, files)
     out = os.path.join(TMP, "ov", f"fp-{key}.json")
     try:
-        res = _fp_server_diff(d, out, orig, timeout) if FP_SERVER else None
-        if res is not None and not FP_CHECK:
-            return res
         subprocess.run([sys.executable, "-c", _STATEFP_CODE, out, orig], cwd=ROOT, env=_statefp_env(d),
                        timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         with open(out) as fh:
-            ref = json.load(fh)
-        if FP_CHECK:
-            same = res is not None and res["diff"] == ref["diff"] and sorted(res["errors"]) == sorted(ref["errors"])
-            log("fp check", key, "same" if same else "DIFFERENT" if res is not None else "no server result",
-                "" if same or res is None else (res["diff"][:3], ref["diff"][:3], res["errors"][:2], ref["errors"][:2]))
-        return ref
+            return json.load(fh)
     except Exception as e:  # noqa: BLE001
         log("state diff failed", key, repr(e))
         return None

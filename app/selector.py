@@ -351,8 +351,6 @@ def main() -> None:
         plans[commit] = {"cand": cand, "specs": specs, "files": files, "mode": mode,
                          "run_est": run_est, "blind_cost": blind_cost, "blind_part": blind_part}
         log(commit, mode, f"cand={len(cand)} est={run_est:.2f} blind={blind_cost:.2f}", notes[:3])
-    if "runner" in sys.modules:
-        sys.modules["runner"].fp_server_stop()  # the state diffs are done: free its memory
 
     jobs = []
     for c, pl in plans.items():
