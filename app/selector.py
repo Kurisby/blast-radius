@@ -42,7 +42,7 @@ EST_OVERRIDE = {MAX_NODES: 0.35}
 EXECUTOR_CLASS_SETUP = 0.35
 PER_JOB_OVERHEAD = 0.3
 # Estimates come from an unpatched run; the scoring machine and patched code can be slower.
-SAFETY = float(os.environ.get("BR_SAFETY", "1.4"))
+SAFETY = float(os.environ.get("BR_SAFETY", "0.01"))  # probe: run every candidate
 P_FAIL_LIKELY = float(os.environ.get("BR_P_LIKELY", "0.95"))  # changed optimizer fixture item: its reader almost always fails
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.05"))
 SIM_SLOW = float(os.environ.get("BR_SIM_SLOW", "1"))  # local test only: act as if CPU were this much slower
