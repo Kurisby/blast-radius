@@ -723,7 +723,7 @@ TPCDS_HASHES = {}  # item -> sha1 of the optimizer output execute() works from (
 TPCDS_PHASHES = {}  # item -> sha1 of the parsed query the pool child receives (pinned commit)
 TPCDS_DUCKQ = {}  # item -> DuckDB SQL of the item at the pinned commit (key into FRAMES)
 TPCDS_TIMES = {}  # item -> {"exec": CPU of running it here, ...} (pinned commit)
-DUCK_QUERY = 0.3  # CPU of one DuckDB query over the TPC-DS CSV views
+DUCK_QUERY = 0.02  # CPU of one DuckDB query on the TPC-DS tables (loaded once, ~0.6 s)
 BOARD_CPU = float(os.environ.get("BR_BOARD_CPU", "1.5"))  # scorer CPU seconds per local one
 FRAMES = None     # {"tpch": {sql: df}, "tpcds": {sql: df}}
 
@@ -967,16 +967,20 @@ class TestHooks:
                 conn = duckdb.connect()
                 for table, columns in schema.items():
                     file_name = f"{directory}{table}.csv.gz"
+                    # the test makes views over the CSVs, so every query parses them again
+                    # (~0.28 s per TPC-DS query); the same rows loaded once into tables give
+                    # the same frames (all TPC-DS queries; TPC-H up to float sum order, which
+                    # assert_frame_equal tolerates) at ~6 ms a query
                     conn.execute(
                         f"""
-                    CREATE VIEW {table} AS
+                    CREATE TABLE {table} AS
                     SELECT *
                     FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
                     """
                     )
                 return conn
 
-            # creating the 32 views costs ~0.5 s of DuckDB CPU; with the recorded results
+            # loading the 32 tables costs ~0.7 s of DuckDB CPU; with the recorded results
             # most runs never send DuckDB a query
             return _LazyConn(make) if FRAMES is not None else make()
 
@@ -1071,7 +1075,7 @@ class TestHooks:
         if marg is not None and (run or duck_new):
             # what is left: DuckDB for the changed SQL, and the runs (with their own DuckDB
             # query when its SQL changed too)
-            left = DUCK_QUERY * len(duck_new)
+            left = DUCK_QUERY * len(duck_new) + (0.6 if duck_new else 0.0)
             for i in run:
                 left += TPCDS_TIMES.get(i, {}).get("exec", 0.3)
                 try:

@@ -178,7 +178,7 @@ def tpcds_state_spec(td, names, readers, allowed=None):
     return spec, tpcds_est(td, spec)
 
 
-DUCK_QUERY = 0.3  # CPU of one DuckDB query over the TPC-DS CSV views (not answered from FRAMES)
+DUCK_QUERY = 0.02  # CPU of one DuckDB query on the TPC-DS tables (not answered from FRAMES)
 
 
 def tpcds_est(td, spec):
