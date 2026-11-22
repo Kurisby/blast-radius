@@ -100,6 +100,7 @@ _orig_generate = _PyGen.generate
 _orig_dgen = _sxp.Python.generator
 cg = {}  # item -> [[input dump json, output source], ...] (None: cannot be replayed)
 depth = {"n": 0}
+overhead = {"t": 0.0}  # CPU of the recording itself, left out of the "exec" times
 def _codegen(fn):
     prev = cur["set"]
     if prev is None or "i" not in opt_holder:
@@ -121,6 +122,7 @@ def wrapped_generate(self, expression, *a, **k):
     i = opt_holder["i"]
     prev = cur["set"]
     cur["set"] = None
+    t_dump = time.process_time()
     try:
         before = json.dumps(dump(expression), sort_keys=True, default=str)
     except Exception:
@@ -128,6 +130,7 @@ def wrapped_generate(self, expression, *a, **k):
     finally:
         cur["set"] = prev
         mon.restart_events()
+        overhead["t"] += time.process_time() - t_dump
     depth["n"] += 1
     try:
         out = _codegen(lambda: _orig_generate(self, expression, *a, **k))
@@ -135,6 +138,7 @@ def wrapped_generate(self, expression, *a, **k):
         depth["n"] -= 1
     rec = cg.setdefault(i, [])
     if rec is not None:
+        t_chk = time.process_time()
         prev = cur["set"]
         cur["set"] = None  # the check below is not the executor's work
         try:
@@ -150,6 +154,7 @@ def wrapped_generate(self, expression, *a, **k):
         finally:
             cur["set"] = prev
             mon.restart_events()
+            overhead["t"] += time.process_time() - t_chk
         if ok:
             rec.append([before, out])
         else:
@@ -171,8 +176,9 @@ for i, (meta, sql, _) in enumerate(cls.tpcds_sqls):
     opt_holder["i"] = i
     cg[i] = []
     phashes[i] = ahash(expr)
+    overhead["t"] = 0.0
     table = record("exec", i, lambda: pickle.loads(pickle.dumps(te.mp_execute(expr, meta))))
-    t2 = time.process_time()
+    t2 = time.process_time() - overhead["t"]
     # baseline hash of what execute() optimizes, computed the way the proxy will
     e2 = pickle.loads(pickle.dumps(parse_one(sql)))
     o = orig_optimize(e2, ensure_schema(te.TPCDS_SCHEMA), leave_tables_isolated=True, dialect=None)

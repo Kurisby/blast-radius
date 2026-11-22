@@ -1073,6 +1073,18 @@ class TestHooks:
                 return "fail"  # the parent parses every query before any runs
             if h != TPCDS_PHASHES.get(i):
                 proxy.append(i)
+        # (the replay is the cheaper check: a query it sends to a run skips the optimizer proxy)
+        cgen = [i for i in plan.get("cg", ()) if i not in run]
+        if cgen:
+            rec = tpcds_codegen()
+            for i in cgen:
+                try:
+                    same = tpcds_codegen_same(rec.get(i))
+                except Exception:  # noqa: BLE001
+                    same = False
+                if not same:
+                    run.add(i)
+            self.out.write(f"NOTE tpcds codegen replayed {len(cgen)} items\n")
         pretty = set(plan.get("pretty", ()))
         for i in proxy:
             if i in run:
@@ -1088,17 +1100,6 @@ class TestHooks:
                 continue
             if h != TPCDS_HASHES.get(i):
                 run.add(i)
-        cgen = [i for i in plan.get("cg", ()) if i not in run]
-        if cgen:
-            rec = tpcds_codegen()
-            for i in cgen:
-                try:
-                    same = tpcds_codegen_same(rec.get(i))
-                except Exception:  # noqa: BLE001
-                    same = False
-                if not same:
-                    run.add(i)
-            self.out.write(f"NOTE tpcds codegen replayed {len(cgen)} items\n")
         frames = (FRAMES or {}).get("tpcds", {})
         duck_new = []
         for i in plan.get("duck", ()):
