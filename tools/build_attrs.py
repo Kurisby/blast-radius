@@ -34,6 +34,8 @@ for p in [q for d in dumps.split(",") for q in glob.glob(os.path.join(d, "*.json
             continue
         base, _, item = ctx.partition("#")
         n = idx.get(base)
+        if n is None and not base.startswith("<"):
+            continue  # a test the track does not list: it is never selected or scored
         for x in keys:
             if n is None:
                 nontest.add(x)

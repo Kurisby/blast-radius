@@ -208,7 +208,7 @@ def dump_state_fp(path: str) -> None:
         json.dump({"errors": outs[0]["errors"], "fp": a, "unstable": unstable}, fh, separators=(",", ":"))
 
 
-def state_diff(key: str, files: dict, timeout: float = 30.0):
+def state_diff(key: str, files: dict, timeout: float = 8.0):
     """Import-time state of the tree with `files` patched in, compared with the pinned
     commit's: {"diff": [(path, kind, info)], "errors": [...], ...} or None."""
     import json

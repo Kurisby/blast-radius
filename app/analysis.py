@@ -385,7 +385,7 @@ class SrcIndex:
                     # nested def header: executed when the outer function runs
                     first = min([st.lineno] + [d.lineno for d in st.decorator_list])
                     return {"kind": "stmt", "lines": range(first, st.body[0].lineno)}
-            return {"kind": "stmt", "lines": range(st.lineno, st.end_lineno + 1)}
+            return {"kind": "stmt", "lines": range(st.lineno, st.end_lineno + 1), "stmt": st, "func": node}
         # not inside any function body: maybe a def header (decorators/signature)
         for node in ast.walk(self.tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -526,11 +526,19 @@ class Analyzer:
         if idx is None:
             return self.module_fallback(rel), [f"{rel}: original unparsable"]
         swap = None
-        if len(added) == 1 and len(removed) == 1 and _OP_RE.search(removed[0]) and _OP_RE.search(added[0]):
-            swap = cmp_swap(original, patched, idx.tree, flips=self.maps.cmp_ok)
-        if (swap is None and len(added) == 1 and len(removed) == 1
+        ptree = None
+        if len(added) == 1 and len(removed) == 1 and (
+                (_OP_RE.search(removed[0]) and _OP_RE.search(added[0]))
+                or (_ANDOR_RE.search(removed[0]) and _ANDOR_RE.search(added[0]))):
+            try:
+                ptree = ast.parse(patched)
+            except SyntaxError:
+                ptree = None
+        if ptree is not None and _OP_RE.search(removed[0]) and _OP_RE.search(added[0]):
+            swap = cmp_swap(original, patched, idx.tree, flips=self.maps.cmp_ok, patched_tree=ptree)
+        if (ptree is not None and swap is None
                 and _ANDOR_RE.search(removed[0]) and _ANDOR_RE.search(added[0])):
-            bswap = bool_swap(original, patched, idx.tree)
+            bswap = bool_swap(original, patched, idx.tree, patched_tree=ptree)
             if bswap is not None:
                 site, line, infected = bswap
                 loc = idx.locate(line)
@@ -566,6 +574,10 @@ class Analyzer:
                         dp = self.default_plan(rel, idx, patched, line, notes)
                         if dp is not None:
                             cov = intersect_plans(cov, dp)
+                    elif kind == "stmt" and len(added) == 1 and len(removed) == 1:
+                        lp = self.local_value_plan(rel, loc, patched, notes)
+                        if lp is not None:
+                            cov = intersect_plans(cov, lp)
                     merge_into(plan, cov)
                     self.touched.append((rel, list(loc["lines"])))
                     notes.append(f"{rel}:{line} {kind}")
@@ -576,22 +588,81 @@ class Analyzer:
                         if pkg is not None and _dialect_own_module(rel):
                             # one dialect's module: its import-time state belongs to the
                             # dialects built on it
-                            self.pending.append(self.module_fallback(rel))
+                            fb = self.module_fallback(rel)
+                            self.pending.append((fb, lambda fb=fb: fb))
                             notes.append(f"{rel}:{line} runs at dialect import")
                         else:
-                            self.pending.append(full_plan(self.maps.all_numbers))
+                            fb = full_plan(self.maps.all_numbers)
+                            self.pending.append((fb, lambda fb=fb: fb))
                             notes.append(f"{rel}:{line} runs at import time")
                 elif kind == "none":
                     continue
                 elif kind == "class":
                     self.nonlocal_change = True
-                    self.pending.append(self.class_change(rel, loc, line))
+                    # (cheap sound bound: the class's users; exact fallback computed only if needed)
+                    inst = self.maps.class_plan(f"{rel[:-3].replace('/', '.')}:{loc['qualname']}")
+                    if inst is None:
+                        inst = self.module_fallback(rel)
+                    self.pending.append((inst, lambda rel=rel, loc=loc, line=line: self.class_change(rel, loc, line)))
                     notes.append(f"{rel}:{line} class {loc['qualname']}")
                 else:
                     self.nonlocal_change = True
-                    self.pending.append(self.module_change(rel, loc, line))
+                    self.pending.append((full_plan(self.maps.all_numbers),
+                                         lambda rel=rel, loc=loc, line=line: self.module_change(rel, loc, line)))
                     notes.append(f"{rel}:{line} module")
         return plan, notes
+
+    def local_value_plan(self, rel, loc, patched, notes) -> dict | None:
+        """`x = <side-effect-free expression>` with a changed constant: the new value can only
+        matter in tests that run a line of the function reading x."""
+        st, fn = loc.get("stmt"), loc.get("func")
+        if fn is None or patched is None:
+            return None
+
+        def simple(st):
+            if isinstance(st, ast.Assign):
+                targets = st.targets
+            elif isinstance(st, (ast.AnnAssign, ast.AugAssign)) and st.value is not None:
+                targets = [st.target]
+            else:
+                return None
+            if not all(isinstance(t, ast.Name) for t in targets):
+                return None
+            if any(not isinstance(n, _PURE_NODES) for n in ast.walk(st.value)):
+                return None
+            return {t.id for t in targets}
+
+        names = simple(st)
+        if not names:
+            return None
+        try:
+            ptree = ast.parse(patched)
+        except SyntaxError:
+            return None
+        pst = None
+        for n in ast.walk(ptree):
+            if isinstance(n, ast.stmt) and n.lineno == st.lineno and n.end_lineno == st.end_lineno \
+                    and type(n) is type(st):
+                pst = n
+                break
+        if pst is None or simple(pst) != names:
+            return None
+        reads = set()
+        for n in ast.walk(fn):
+            if isinstance(n, (ast.Global, ast.Nonlocal)) and names & set(n.names):
+                return None
+            if isinstance(n, ast.Name):
+                if n.id in ("locals", "vars", "eval", "exec"):
+                    return None
+                if n.id in names and isinstance(n.ctx, ast.Load):
+                    reads.add(n.lineno)
+            if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) and n.target.id in names:
+                reads.add(n.lineno)
+        plan: dict = {}
+        for l in sorted(reads):
+            merge_into(plan, self.maps.cover_lines(rel, [l]))
+        notes.append(f"local {','.join(sorted(names))} read on {len(reads)} lines -> {len(plan)} tests")
+        return plan
 
     def default_plan(self, rel, idx, patched, line, notes) -> dict | None:
         """A def header whose only change is default values: the tests in which a call left
@@ -638,18 +709,29 @@ class Analyzer:
                 changed.append(kw.arg)
         if not changed:
             return None
-        owner = f"def:{rel}:{first}"
-        if a["wrapped"].get(owner) != "D":
-            notes.append(f"default {changed}: function not profiled")
-            return None
+        # a default can only matter where the function reads the parameter
+        reads = set()
+        for n in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+            if isinstance(n, ast.Name):
+                if n.id in ("locals", "vars") or (n.id in changed and isinstance(n.ctx, ast.Load)):
+                    if n.id in ("locals", "vars"):
+                        return None
+                    reads.add(n.lineno)
         plan: dict = {}
-        for nm in changed:
-            name = f"{owner}|P:{nm}"
-            if name in a["nontest"]:
-                notes.append(f"default {nm}: used outside tests")
-                return None
-            self.maps.attr_entry(plan, name)
-        notes.append(f"default {','.join(changed)} -> {len(plan)} tests")
+        for l in sorted(reads):
+            merge_into(plan, self.maps.cover_lines(rel, [l]))
+        owner = f"def:{rel}:{first}"
+        if a["wrapped"].get(owner) == "D":
+            dp: dict = {}
+            for nm in changed:
+                name = f"{owner}|P:{nm}"
+                if name in a["nontest"]:
+                    dp = None
+                    break
+                self.maps.attr_entry(dp, name)
+            if dp is not None:
+                plan = intersect_plans(plan, dp)
+        notes.append(f"default {','.join(changed)} read on {len(reads)} lines -> {len(plan)} tests")
         return plan
 
     def class_change(self, rel, loc, line) -> dict:
@@ -848,12 +930,12 @@ class Analyzer:
             merge_into_plan_any(plan, p)
             notes += n
         if self.pending:
-            size = len(set().union(*self.pending))
             sp = None
-            if ok_overlay and size > STATEFP_MIN_TESTS:
+            if ok_overlay and len(set().union(*(b for b, _ in self.pending))) > STATEFP_MIN_TESTS:
                 sp = self.state_plan(files, notes)
-            for pp in self.pending:
-                merge_into_plan_any(plan, pp if sp is None else intersect_plans(pp, sp))
+            for b, f in self.pending:
+                # each bound is sound on its own: with the state diff, the cheap one is enough
+                merge_into_plan_any(plan, f() if sp is None else intersect_plans(b, sp))
         return plan, notes, (files if ok_overlay else None)
 
 
@@ -877,7 +959,24 @@ _OPNAME = {ast.Is: "is", ast.IsNot: "in", ast.Eq: "eq", ast.NotEq: "ne", ast.Lt:
            ast.Gt: "gt", ast.GtE: "ge"}
 
 
-def cmp_swap(original: str, patched: str, orig_tree=None, flips=False):
+def _start(n) -> int:
+    return min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", ())])
+
+
+def _walk_line(tree, line):
+    """ast.walk restricted to nodes whose span can contain `line` (and position-less helper
+    nodes such as comprehensions and arguments along that path)."""
+    todo = [tree]
+    while todo:
+        node = todo.pop()
+        yield node
+        for ch in ast.iter_child_nodes(node):
+            lo = getattr(ch, "lineno", None)
+            if lo is None or _start(ch) <= line <= (getattr(ch, "end_lineno", None) or lo):
+                todo.append(ch)
+
+
+def cmp_swap(original: str, patched: str, orig_tree=None, flips=False, patched_tree=None):
     """If the patch only swaps the operator of one profiled comparison between two operators
     that differ on a single outcome class (is/==, is not/!=, </<=, >/>=), return
     ("line:col:op", line, outcome classes that tell them apart)."""
@@ -891,11 +990,11 @@ def cmp_swap(original: str, patched: str, orig_tree=None, flips=False):
     line = diff[0] + 1
     try:
         ta = orig_tree if orig_tree is not None else ast.parse(original)
-        tb = ast.parse(patched)
+        tb = patched_tree if patched_tree is not None else ast.parse(patched)
     except SyntaxError:
         return None
-    ca = {(n.lineno, n.col_offset): n for n in ast.walk(ta) if isinstance(n, ast.Compare) and n.lineno == line}
-    cb = {(n.lineno, n.col_offset): n for n in ast.walk(tb) if isinstance(n, ast.Compare) and n.lineno == line}
+    ca = {(n.lineno, n.col_offset): n for n in _walk_line(ta, line) if isinstance(n, ast.Compare) and n.lineno == line}
+    cb = {(n.lineno, n.col_offset): n for n in _walk_line(tb, line) if isinstance(n, ast.Compare) and n.lineno == line}
     found = None
     for k, na in ca.items():
         nb = cb.get(k)
@@ -976,9 +1075,10 @@ def _formula(node, leaves):
     return ("L", len(leaves) - 1)
 
 
-def _formula_roots(tree):
+def _formula_roots(tree, line=None):
     """Profiled formula roots: tests of if/while/assert/conditional expressions and
-    comprehension filters inside functions, rooted at a BoolOp or `not` of a BoolOp."""
+    comprehension filters inside functions, rooted at a BoolOp or `not` of a BoolOp
+    (with `line`: only the subtrees whose span contains that line are visited)."""
     roots = []
 
     def is_root(t):
@@ -988,6 +1088,10 @@ def _formula_roots(tree):
 
     def visit(node, in_func):
         for child in ast.iter_child_nodes(node):
+            if line is not None:
+                lo = getattr(child, "lineno", None)
+                if lo is not None and not (_start(child) <= line <= (getattr(child, "end_lineno", None) or lo)):
+                    continue
             f = in_func or isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
             tests = []
             if isinstance(child, (ast.If, ast.While, ast.IfExp, ast.Assert)):
@@ -1028,7 +1132,7 @@ def _outcome(shape, vec):
         return "E"
 
 
-def bool_swap(original: str, patched: str, orig_tree=None):
+def bool_swap(original: str, patched: str, orig_tree=None, patched_tree=None):
     """If the patch only changes and/or operators of one profiled formula (same leaves),
     return ("line:col", line, infected(vector) predicate)."""
     a = original.split("\n")
@@ -1041,14 +1145,14 @@ def bool_swap(original: str, patched: str, orig_tree=None):
     line = diff[0] + 1
     try:
         ta = orig_tree if orig_tree is not None else ast.parse(original)
-        tb = ast.parse(patched)
+        tb = patched_tree if patched_tree is not None else ast.parse(patched)
     except SyntaxError:
         return None
-    ra = [r for r in _formula_roots(ta) if r.lineno <= line <= r.end_lineno]
+    ra = [r for r in _formula_roots(ta, line) if r.lineno <= line <= r.end_lineno]
     if len(ra) != 1:
         return None
     root_a = ra[0]
-    rb = [r for r in _formula_roots(tb) if (r.lineno, r.col_offset) == (root_a.lineno, root_a.col_offset)]
+    rb = [r for r in _formula_roots(tb, line) if (r.lineno, r.col_offset) == (root_a.lineno, root_a.col_offset)]
     if len(rb) != 1:
         return None
     root_b = rb[0]
@@ -1094,6 +1198,13 @@ def bool_swap(original: str, patched: str, orig_tree=None):
         return _outcome(sa, vec) != _outcome(sb, vec)
 
     return f"{root_a.lineno}:{root_a.col_offset}", line, infected
+
+
+# expression nodes whose evaluation has no side effects a changed constant could alter
+# (no calls, subscripts, division or comprehensions)
+_PURE_NODES = (ast.Constant, ast.Name, ast.Attribute, ast.BoolOp, ast.UnaryOp, ast.BinOp, ast.Compare,
+               ast.IfExp, ast.Tuple, ast.List, ast.Set, ast.Dict, ast.expr_context, ast.boolop, ast.unaryop,
+               ast.Add, ast.Sub, ast.Mult, ast.BitOr, ast.BitAnd, ast.BitXor, ast.cmpop)
 
 
 def intersect_plans(a: dict, b: dict) -> dict:
