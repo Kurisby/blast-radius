@@ -582,6 +582,7 @@ def _child(wfd: int, overlay: str, tests: list[tuple[str, float]], extra: dict) 
         suite = unittest.TestSuite()
         id_of = {}
         limit_of = {}
+        failed = set()
         for path, items in by_file.items():
             modname = path[:-3].replace("/", ".")
             try:
@@ -608,7 +609,6 @@ def _child(wfd: int, overlay: str, tests: list[tuple[str, float]], extra: dict) 
                 suite.addTest(case)
 
         done = set()
-        failed = set()
 
         timed_out = []
 
@@ -794,6 +794,29 @@ def parse_tpc_rows():
     return rows_by
 
 
+class _LazyConn:
+    """A DuckDB connection made on first use."""
+
+    def __init__(self, make):
+        self._make = make
+        self._conn = None
+
+    def _get(self):
+        if self._conn is None:
+            self._conn = self._make()
+        return self._conn
+
+    def execute(self, *a, **k):
+        return self._get().execute(*a, **k)
+
+    def close(self):
+        if self._conn is not None:
+            self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+
 class _ConnProxy:
     """DuckDB connection that answers queries recorded at the pinned commit from cache."""
 
@@ -916,29 +939,34 @@ class TestHooks:
             return
         import duckdb
 
+        def views(directory, schema):
+            def make():
+                conn = duckdb.connect()
+                for table, columns in schema.items():
+                    file_name = f"{directory}{table}.csv.gz"
+                    conn.execute(
+                        f"""
+                    CREATE VIEW {table} AS
+                    SELECT *
+                    FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                    """
+                    )
+                return conn
+
+            # creating the 32 views costs ~0.5 s of DuckDB CPU; with the recorded results
+            # most runs never send DuckDB a query
+            return _LazyConn(make) if FRAMES is not None else make()
+
         @classmethod
         def setUpClass(cls):
-            cls.tpch_conn = duckdb.connect()
-            cls.tpcds_conn = duckdb.connect()
+            cls.tpch_conn = views(te.DIR_TPCH, te.TPCH_SCHEMA)
+            cls.tpcds_conn = views(te.DIR_TPCDS, te.TPCDS_SCHEMA)
             cls.tpch_tables = {}
             cls.tpcds_tables = {}
-
-            def setup(conn, directory, table, columns, tables, kind):
-                file_name = f"{directory}{table}.csv.gz"
-                conn.execute(
-                    f"""
-                CREATE VIEW {table} AS
-                SELECT *
-                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
-                """
-                )
-                rows = list(PRE_ROWS[(kind, table)])
-                tables[table] = te.Table(columns=columns, rows=rows)
-
-            for table, columns in te.TPCH_SCHEMA.items():
-                setup(cls.tpch_conn, te.DIR_TPCH, table, columns, cls.tpch_tables, "tpch")
-            for table, columns in te.TPCDS_SCHEMA.items():
-                setup(cls.tpcds_conn, te.DIR_TPCDS, table, columns, cls.tpcds_tables, "tpcds")
+            for kind, schema, tables in (("tpch", te.TPCH_SCHEMA, cls.tpch_tables),
+                                         ("tpcds", te.TPCDS_SCHEMA, cls.tpcds_tables)):
+                for table, columns in schema.items():
+                    tables[table] = te.Table(columns=columns, rows=list(PRE_ROWS[(kind, table)]))
             cls.cache = {}
             cls.tpch_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
             cls.tpcds_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
