@@ -43,6 +43,7 @@ def record(phase, i, fn):
 
 orig_optimize = sx.optimize
 hashes = {}
+duckq = {}  # item -> the DuckDB SQL its expected frame came from (pinned commit)
 phashes = {}  # item -> sha1 of the parsed query as the pool child receives it (pickle = serde dump/load)
 def ahash(e):
     return hashlib.sha1(json.dumps(dump(e), sort_keys=True, default=str).encode()).hexdigest()
@@ -107,12 +108,13 @@ for i, (meta, sql, _) in enumerate(cls.tpcds_sqls):
     assert ahash(o) == hashes[i], i  # generating SQL leaves the expression as it was
     t3 = time.process_time()
     duck_sql = record("duck", i, lambda: transpile(sql, write="duckdb")[0])
+    duckq[i] = duck_sql
     # comparison side: DataFrame from table rows
     import numpy as np, pandas as pd
     record("exec", i, lambda: pd.DataFrame(((np.nan if c is None else c for c in r) for r in table.rows), columns=table.columns))
     times[i] = {"parse": round(t1 - t0, 4), "exec": round(t2 - t1, 4), "proxy": round(t3 - t2, 4)}
 
-res = {"phases": {}, "hashes": hashes, "phashes": phashes, "times": times}
+res = {"phases": {}, "hashes": hashes, "phashes": phashes, "duckq": duckq, "times": times}
 for ph, d in phases.items():
     byfile = {}
     for (f, l), items in d.items():

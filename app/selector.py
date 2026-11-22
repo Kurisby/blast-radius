@@ -126,6 +126,8 @@ def tpcds_spec(td, touched, plan_items):
     run |= (set(plan_items) - known) & executed
     parse_only = (set(plan_items) - known) - executed
     proxy = ((opt | pretty) & executed) - run
+    # (queries whose DuckDB SQL may change: DuckDB then runs it over the CSV views)
+    duckrun = duck & run
     spec = {
         "run": sorted(run),
         "proxy": sorted(proxy),
@@ -135,6 +137,7 @@ def tpcds_spec(td, touched, plan_items):
         "pretty": sorted(pretty & proxy),
         "parse": sorted((parse - executed) | parse_only),
         "duck": sorted(duck - run),
+        "duckrun": sorted(duckrun),
     }
     return spec, tpcds_est(td, spec)
 
@@ -175,11 +178,22 @@ def tpcds_state_spec(td, names, readers, allowed=None):
     return spec, tpcds_est(td, spec)
 
 
+DUCK_QUERY = 0.3  # CPU of one DuckDB query over the TPC-DS CSV views (not answered from FRAMES)
+
+
 def tpcds_est(td, spec):
     t = td["times"]
+    # (expected cost: the cheap checks usually settle a query; budgets use tpcds_worst)
     return (sum(t.get(i, {}).get("exec", 0.3) for i in spec["run"]) + 0.04 * len(spec["proxy"])
-            + 0.008 * len(spec.get("phash", ())) + 0.012 * len(spec["duck"])
+            + 0.008 * len(spec.get("phash", ())) + 0.02 * len(spec["duck"])
             + 0.005 * len(spec["parse"]) + 0.05)
+
+
+def tpcds_worst(td, spec):
+    """CPU if every cheap check falls back to running its query (for budgets, not choices)."""
+    t = td["times"]
+    checked = set(spec["run"]) | set(spec["proxy"]) | set(spec.get("phash", ())) | set(spec["duck"])
+    return (sum(t.get(i, {}).get("exec", 0.3) + DUCK_QUERY + 0.06 for i in checked) + 0.8)
 
 
 # The TPC-H executor test runs the same executor over the other TPC data: when it fails the
@@ -409,10 +423,10 @@ def main() -> None:
                             st = (both, tpcds_est(td, both))
                 if td is not None and isinstance(v, set) and not analyzer.nonlocal_change:
                     tspec, est = tpcds_spec(td, analyzer.touched, v)
-                    spec = {"tpcds": tspec, "gate": tpcds_gate(gate, est)}
+                    spec = {"tpcds": tspec, "gate": tpcds_gate(gate, est), "_worst": tpcds_worst(td, tspec)}
                 elif st is not None:
                     tspec, est = st
-                    spec = {"tpcds": tspec, "gate": tpcds_gate(gate, est)}
+                    spec = {"tpcds": tspec, "gate": tpcds_gate(gate, est), "_worst": tpcds_worst(td, tspec)}
                 else:
                     idxs = spec.get("pool")
                     if spec.get("pairs") is not None:
@@ -450,15 +464,24 @@ def main() -> None:
             continue
         items = []
         for tid, spec in sorted(pl["specs"].items()):
+            if spec.get("tpcds") is not None and tid in maps.number_by_id:
+                # what listing the TPC-DS test adds to this commit's listed cost: its check
+                # gives up (lists it) once the runs it would need cost more than that
+                bp = set(pl["blind_part"])
+                spec["tpcds_marg"] = round(output_cost(bp | {maps.number_by_id[tid]}, duration_ms)
+                                           - output_cost(bp, duration_ms), 3)
             # CPU seconds; a timeout only lists the test, it can never miss a failure
             est = spec.get("_est", 0.3)
-            limit = (0.8 + 3.0 * max(est, min(spec.get("_full", est), 2 * est + 0.5))) / SIM_SLOW
+            limit = (0.8 + 3.0 * max(est, min(spec.get("_full", est), 2 * est + 0.5),
+                                     spec.get("_worst", 0.0))) / SIM_SLOW
             if spec.get("replica"):
                 limit = 3.0
             items.append((tid, limit, spec))
         ran = {maps.number_by_id[tid] for tid in pl["specs"]}
         # running can never be worth more CPU than listing what it runs
-        cap = BUDGET_MULT * pl["run_est"] + 0.8 if BUDGET_MULT > 0 else float("inf")
+        # (a TPC-DS check whose cheap tests fall back to runs may spend up to its worst case)
+        extra = sum(max(0.0, sp.get("_worst", 0.0) - sp.get("_est", 0.0)) for sp in pl["specs"].values())
+        cap = BUDGET_MULT * (pl["run_est"] + extra) + 0.8 if BUDGET_MULT > 0 else float("inf")
         budget = max(1.0, min(output_cost(ran, duration_ms), cap)) / SIM_SLOW
         pl["budget"] = budget
         jobs.append((c, pl["files"], items, budget, module_names(pl["files"])))
@@ -503,7 +526,7 @@ def main() -> None:
                 sel = failed | unknown | (pl["cand"] - ran)
                 total_est += pl["run_est"]
                 log(c, f"est {pl['run_est']:.2f} budget {pl.get('budget', 0):.2f} cpu {r.get('cpu') or 0:.2f} wall {r['seconds']:.2f} "
-                       f"failed {len(failed)} unknown {len(unknown)}", [n for n in r["notes"] if not n.startswith("NOTE t ")][:3])
+                       f"failed {len(failed)} unknown {len(unknown)}", [n for n in r["notes"] if not n.startswith("NOTE t ")][:int(os.environ.get("BR_NOTES", "3"))])
                 if os.environ.get("BR_VERBOSE"):
                     tl = sorted(((float(n.split()[-1]), n.split()[2]) for n in r["notes"] if n.startswith("NOTE t ")), reverse=True)
                     log("   slowest", [(round(a, 2), b.split("::")[-1]) for a, b in tl[:6]])

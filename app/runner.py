@@ -716,6 +716,10 @@ def _max_nodes_replica(self):
 PRE_ROWS = None   # {(kind, table): rows}
 TPCDS_HASHES = {}  # item -> sha1 of the optimizer output execute() works from (pinned commit)
 TPCDS_PHASHES = {}  # item -> sha1 of the parsed query the pool child receives (pinned commit)
+TPCDS_DUCKQ = {}  # item -> DuckDB SQL of the item at the pinned commit (key into FRAMES)
+TPCDS_TIMES = {}  # item -> {"exec": CPU of running it here, ...} (pinned commit)
+DUCK_QUERY = 0.3  # CPU of one DuckDB query over the TPC-DS CSV views
+BOARD_CPU = float(os.environ.get("BR_BOARD_CPU", "1.5"))  # scorer CPU seconds per local one
 FRAMES = None     # {"tpch": {sql: df}, "tpcds": {sql: df}}
 
 
@@ -726,13 +730,15 @@ def preload_executor_data():
     import gzip
     import pickle
 
-    global TPCDS_HASHES, TPCDS_PHASHES
+    global TPCDS_HASHES, TPCDS_PHASHES, TPCDS_DUCKQ, TPCDS_TIMES
     try:
         import json as _json
         with gzip.open(os.path.join(APP, "tpcds.json.gz"), "rt") as fh:
             d = _json.load(fh)
         TPCDS_HASHES = {int(k): v for k, v in d["hashes"].items()}
         TPCDS_PHASHES = {int(k): v for k, v in d.get("phashes", {}).items()}
+        TPCDS_DUCKQ = {int(k): v for k, v in d.get("duckq", {}).items()}
+        TPCDS_TIMES = {int(k): v for k, v in d.get("times", {}).items()}
     except Exception as e:  # noqa: BLE001
         log("tpcds hashes unavailable", repr(e))
     try:
@@ -818,6 +824,15 @@ class _LazyConn:
 
     def __getattr__(self, name):
         return getattr(self._get(), name)
+
+
+def _same_frame(a, b) -> bool:
+    """Exactly the same frame: columns, dtypes, index and values (NaN in the same places)."""
+    try:
+        return (a.shape == b.shape and list(a.columns) == list(b.columns)
+                and list(a.dtypes) == list(b.dtypes) and a.index.equals(b.index) and a.equals(b))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class _ConnProxy:
@@ -1033,6 +1048,7 @@ class TestHooks:
             if h != TPCDS_HASHES.get(i):
                 run.add(i)
         frames = (FRAMES or {}).get("tpcds", {})
+        duck_new = []
         for i in plan.get("duck", ()):
             if i in run:
                 continue
@@ -1042,7 +1058,41 @@ class TestHooks:
                 run.add(i)
                 continue
             if q not in frames:
-                run.add(i)
+                if os.environ.get("BR_DUCKCHECK") == "0":
+                    run.add(i)
+                else:
+                    duck_new.append((i, q))
+        marg = spec.get("tpcds_marg")
+        if marg is not None and (run or duck_new):
+            # what is left: DuckDB for the changed SQL, and the runs (with their own DuckDB
+            # query when its SQL changed too)
+            left = DUCK_QUERY * len(duck_new)
+            for i in run:
+                left += TPCDS_TIMES.get(i, {}).get("exec", 0.3)
+                try:
+                    if transpile(sqls[i][1], write="duckdb")[0] not in frames:
+                        left += DUCK_QUERY
+                except Exception:  # noqa: BLE001
+                    pass
+            if left * BOARD_CPU > marg:
+                self.out.write(f"NOTE tpcds listed: {left:.1f} s left > {marg:.1f} s listed\n")
+                return "fail"
+        if duck_new:
+            # the executor side is settled; the test compares its rows with DuckDB's for this
+            # SQL: an identical frame to the recorded one passes as it did at the pinned commit
+            conn = type(test).tpcds_conn
+            cache = getattr(type(test), "cache", None)
+            for i, q in duck_new:
+                base = frames.get(TPCDS_DUCKQ.get(i))
+                try:
+                    df = conn.execute(q).fetchdf()
+                    if base is None or not _same_frame(df, base):
+                        run.add(i)
+                        if isinstance(cache, dict):
+                            cache[sqls[i][1]] = df  # what cached_execute would compute for it
+                except Exception:  # noqa: BLE001
+                    run.add(i)
+            self.out.write(f"NOTE tpcds duckdb checked {len(duck_new)} items\n")
         if not run:
             return "pass"
         test.tpcds_sqls = [x for j, x in enumerate(sqls) if j in run]
