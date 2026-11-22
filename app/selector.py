@@ -20,7 +20,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXP
 APP = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP)
 
-from analysis import FULL, Analyzer, Maps, merge_into  # noqa: E402
+from analysis import FULL, Analyzer, Maps  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 SQLGLOT = Path(os.environ.get("BR_SQLGLOT", "/sqlglot"))
@@ -368,9 +368,8 @@ def main() -> None:
                     or maps.id_by_number[o].split("::")[-1] in ("test_tpcds", "test_tpch", "test_optimize"))]
                 st = None
                 if (td is not None and analyzer.nonlocal_change and not analyzer.hard_nonlocal
-                        and analyzer.state_names is not None):
-                    # the import-time effects are what the state diff found: per query, the
-                    # phase that reads changed state, plus the phase that runs a changed line
+                        and analyzer.state_names is not None and not analyzer.touched):
+                    # only import-time state changed, and the state diff says what
                     readers = set()
                     for n in analyzer.state_names:
                         e = {}
@@ -379,22 +378,6 @@ def main() -> None:
                             readers.add(n)
                     st = tpcds_state_spec(td, analyzer.state_names, readers,
                                           set(v) if isinstance(v, set) else None)
-                    if st is not None and analyzer.touched:
-                        cov = {}
-                        for rel, lines in analyzer.touched:
-                            merge_into(cov, maps.cover_lines(rel, lines))
-                        if t in cov:
-                            ci = cov[t]
-                            n_items = maps.items_count.get(t) or 99
-                            items = set(range(n_items)) if ci is FULL else set(ci)
-                            lspec, _ = tpcds_spec(td, analyzer.touched, items)
-                            sspec = st[0]
-                            run = set(sspec["run"]) | set(lspec["run"])
-                            both = {"run": sorted(run)}
-                            for k in ("proxy", "duck"):
-                                both[k] = sorted((set(sspec[k]) | set(lspec[k])) - run)
-                            both["parse"] = sorted(set(sspec["parse"]) | set(lspec["parse"]))
-                            st = (both, tpcds_est(td, both))
                 if td is not None and isinstance(v, set) and not analyzer.nonlocal_change:
                     tspec, est = tpcds_spec(td, analyzer.touched, v)
                     spec = {"tpcds": tspec, "gate": tpcds_gate(gate, est)}
