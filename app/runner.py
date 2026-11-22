@@ -735,6 +735,17 @@ def tpcds_codegen():
     return _TPCDS_CG["d"]
 
 
+def _code_key(co):
+    """Everything of a code object that decides what it does (not its file or line table)."""
+    import types as _types
+
+    consts = tuple(_code_key(c) if isinstance(c, _types.CodeType) else (type(c).__name__, repr(c))
+                   for c in co.co_consts)
+    return (co.co_code, consts, co.co_names, co.co_varnames, co.co_freevars, co.co_cellvars,
+            co.co_flags, co.co_argcount, co.co_posonlyargcount, co.co_kwonlyargcount,
+            co.co_nlocals, co.co_stacksize, co.co_exceptiontable)
+
+
 def tpcds_codegen_same(rec):
     """Replay the recorded generator calls with the code under test: True when every call
     gives the recorded source and leaves its input as it was (the run then compiles and
@@ -748,7 +759,11 @@ def tpcds_codegen_same(rec):
     gen = Python().generator(identify=True, comments=False)
     for d_in, out in rec:
         e = load(_json.loads(d_in))
-        if gen.generate(e) != out:
+        got = gen.generate(e)
+        # the executor only runs compile(source, source, "eval", optimize=2): source that
+        # differs only in spacing or redundant parentheses compiles to the same code
+        if got != out and _code_key(compile(got, "<g>", "eval", optimize=2)) != _code_key(
+                compile(out, "<g>", "eval", optimize=2)):
             return False
         if _json.dumps(dump(e), sort_keys=True, default=str) != d_in:
             return False
