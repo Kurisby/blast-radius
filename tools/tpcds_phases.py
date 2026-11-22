@@ -88,6 +88,78 @@ def wrapped_sql(self, *a, **k):
     return _orig_sql(self, *a, **k)
 _exp.Expression.sql = wrapped_sql
 
+# PythonExecutor turns plan expressions into Python source with its generator and runs what
+# it compiles: a line that only that code generation runs ("codegen") can change the run only
+# through the source it returns (or by changing the expression it is given). Record, per
+# query, every expression the executor hands the generator and the source it got back: the
+# runner replays them with the patched generator instead of running the query.
+import sqlglot.executor.python as _sxp
+from sqlglot.serde import load as _load
+_PyGen = _sxp.PythonGenerator
+_orig_generate = _PyGen.generate
+_orig_dgen = _sxp.Python.generator
+cg = {}  # item -> [[input dump json, output source], ...] (None: cannot be replayed)
+depth = {"n": 0}
+def _codegen(fn):
+    prev = cur["set"]
+    if prev is None or "i" not in opt_holder:
+        return fn()
+    s = set()
+    cur["set"] = s
+    mon.restart_events()
+    try:
+        return fn()
+    finally:
+        cur["set"] = prev
+        mon.restart_events()
+        d = phases.setdefault("codegen", {})
+        for key in s:
+            d.setdefault(key, set()).add(opt_holder["i"])
+def wrapped_generate(self, expression, *a, **k):
+    if depth["n"] or cur["set"] is None:
+        return _orig_generate(self, expression, *a, **k)
+    i = opt_holder["i"]
+    prev = cur["set"]
+    cur["set"] = None
+    try:
+        before = json.dumps(dump(expression), sort_keys=True, default=str)
+    except Exception:
+        before = None
+    finally:
+        cur["set"] = prev
+        mon.restart_events()
+    depth["n"] += 1
+    try:
+        out = _codegen(lambda: _orig_generate(self, expression, *a, **k))
+    finally:
+        depth["n"] -= 1
+    rec = cg.setdefault(i, [])
+    if rec is not None:
+        prev = cur["set"]
+        cur["set"] = None  # the check below is not the executor's work
+        try:
+            after = json.dumps(dump(expression), sort_keys=True, default=str)
+            ok = before is not None and after == before and not a and not k
+            if ok:
+                # the replay must reproduce it from the dump alone
+                e2 = _load(json.loads(before))
+                ok = _orig_generate(_orig_dgen(_sxp.Python(), identify=True, comments=False), e2) == out \
+                    and json.dumps(dump(e2), sort_keys=True, default=str) == before
+        except Exception:
+            ok = False
+        finally:
+            cur["set"] = prev
+            mon.restart_events()
+        if ok:
+            rec.append([before, out])
+        else:
+            cg[i] = None
+    return out
+_PyGen.generate = wrapped_generate
+def wrapped_dgen(self, *a, **k):
+    return _codegen(lambda: _orig_dgen(self, *a, **k))
+_sxp.Python.generator = wrapped_dgen
+
 times = {}
 for i, (meta, sql, _) in enumerate(cls.tpcds_sqls):
     t0 = time.process_time()
@@ -97,6 +169,7 @@ for i, (meta, sql, _) in enumerate(cls.tpcds_sqls):
         times[i] = {"parse": round(t1 - t0, 4)}
         continue
     opt_holder["i"] = i
+    cg[i] = []
     phashes[i] = ahash(expr)
     table = record("exec", i, lambda: pickle.loads(pickle.dumps(te.mp_execute(expr, meta))))
     t2 = time.process_time()
@@ -122,6 +195,11 @@ for ph, d in phases.items():
     res["phases"][ph] = byfile
 with gzip.open(out, "wt") as fh:
     json.dump(res, fh, separators=(",", ":"))
+if len(sys.argv) > 3:
+    with gzip.open(sys.argv[3], "wt") as fh:
+        json.dump({str(k): v for k, v in cg.items()}, fh, separators=(",", ":"))
+    print("codegen replay", sum(v is not None for v in cg.values()), "of", len(cg),
+          "calls", sum(len(v) for v in cg.values() if v), os.path.getsize(sys.argv[3]))
 print("phases", {k: len(v) for k, v in phases.items()}, "hashes", len(hashes),
       "exec total", round(sum(v.get("exec", 0) for v in times.values()), 2),
       "proxy total", round(sum(v.get("proxy", 0) for v in times.values()), 2), os.path.getsize(out))

@@ -122,10 +122,13 @@ def tpcds_spec(td, touched, plan_items):
     opt = items("optimize") & allowed
     pretty = items("pretty") & allowed
     duck = items("duck") & allowed
-    known = run | parse | opt | pretty | duck
+    # changed only in the executor's Python code generation: the optimizer output must hash
+    # as at the pinned commit, then the recorded generator calls are replayed
+    cgen = items("codegen") & allowed
+    known = run | parse | opt | pretty | duck | cgen
     run |= (set(plan_items) - known) & executed
     parse_only = (set(plan_items) - known) - executed
-    proxy = ((opt | pretty) & executed) - run
+    proxy = ((opt | pretty | cgen) & executed) - run
     # (queries whose DuckDB SQL may change: DuckDB then runs it over the CSV views)
     duckrun = duck & run
     spec = {
@@ -138,6 +141,7 @@ def tpcds_spec(td, touched, plan_items):
         "parse": sorted((parse - executed) | parse_only),
         "duck": sorted(duck - run),
         "duckrun": sorted(duckrun),
+        "cg": sorted(cgen & proxy),
     }
     return spec, tpcds_est(td, spec)
 
@@ -186,7 +190,7 @@ def tpcds_est(td, spec):
     # (expected cost: the cheap checks usually settle a query; budgets use tpcds_worst)
     return (sum(t.get(i, {}).get("exec", 0.3) for i in spec["run"]) + 0.04 * len(spec["proxy"])
             + 0.008 * len(spec.get("phash", ())) + 0.02 * len(spec["duck"])
-            + 0.005 * len(spec["parse"]) + 0.05)
+            + 0.005 * len(spec["parse"]) + 0.015 * len(spec.get("cg", ())) + 0.05)
 
 
 def tpcds_worst(td, spec):
@@ -419,6 +423,7 @@ def main() -> None:
                             both["phash"] = sorted((set(sspec.get("phash", ())) | set(lspec.get("phash", ())))
                                                    - run - set(both["proxy"]))
                             both["pretty"] = sorted(set(lspec.get("pretty", ())) & set(both["proxy"]))
+                            both["cg"] = sorted(set(lspec.get("cg", ())) & set(both["proxy"]))
                             both["parse"] = sorted(set(sspec["parse"]) | set(lspec["parse"]))
                             st = (both, tpcds_est(td, both))
                 if td is not None and isinstance(v, set) and not analyzer.nonlocal_change:
