@@ -19,6 +19,9 @@ All maps in `app/` are built from the unpatched pinned commit; nothing is keyed 
   `build_attrs.py` merges those dumps into `app/attrs.json.gz`. At run time the
   selector compares the import-time state of a patched tree with the pinned commit's
   (`app/statefp.py`, fingerprint built in the image) and selects the tests that read what changed.
+- `tpcds_attr_phases.py`: which class attributes and class-dict keys each TPC-DS query reads in
+  each phase (parse, optimize, execute, DuckDB transpile), so a changed setting gets the cheap
+  check of the phase that reads it (`app/tpcds_attrs.json.gz`; built under 3 hash seeds, merged).
 - `tpcds_phases.py`, `baseline_frames.py`: TPC-DS phase coverage and recorded DuckDB results
   for the executor tests.
 - `mkmut.py`: local evaluation only. Makes random kit-style mutants of the pinned tree and

@@ -447,8 +447,11 @@ class Analyzer:
         self._idx = {}
         self._starts = {}
         self._all_sources = None
+        self._trees = {}
         self.touched = []      # [(rel, lines)] statement-level changes of the last analyze()
         self.nonlocal_change = False
+        self.hard_nonlocal = False  # a non-local change the import-time state diff cannot explain
+        self.state_names = None     # profile names of the state the last patch changed (None: unknown)
         self.pending = []      # plans of changes whose only extra effect is import-time state
         self._fp_n = 0
 
@@ -545,7 +548,7 @@ class Analyzer:
                 and none_compare_equivalent(original, patched)):
             return {}, [f"{rel}: None-comparison swap (equivalent)"]
         if patched is None or not compiles(patched, rel):
-            self.nonlocal_change = True
+            self.nonlocal_change = self.hard_nonlocal = True
             notes.append(f"{rel}: does not apply/compile")
             plan = self.module_fallback(rel)
             if not any(seg in rel for seg in ("/dialects/", "/generators/", "/parsers/", "/tokenizers/", "/typing/")):
@@ -900,6 +903,7 @@ class Analyzer:
         unstable = set(res.get("unstable", ()))
         wrapped, nontest = a["wrapped"], a["nontest"]
         plan: dict = {}
+        used: set = set()
         for path, kind, info in res["diff"]:
             w = wrapped.get(path)
             if path in unstable:
@@ -926,8 +930,15 @@ class Analyzer:
                         names.append(init)
                     else:
                         # copied into the tokenizer core when a tokenizer is built: only tests
-                        # that build one from this class and read that core slot can see it
-                        self._intersect_entries(plan, init, f"{slot}|@")
+                        # that build one from this class and read that core slot can see it,
+                        # and only where a line that uses the slot's value ran
+                        sub: dict = {}
+                        self._intersect_entries(sub, init, f"{slot}|@")
+                        used.update((init, f"{slot}|@"))
+                        uses = self.slot_use_plan(slot)
+                        if uses is not None:
+                            sub = intersect_plans(sub, uses)
+                        merge_into(plan, sub)
             else:
                 notes.append(f"state diff: {kind} {path} not profiled")
                 return None
@@ -936,7 +947,86 @@ class Analyzer:
                     notes.append(f"state diff: {n} read outside tests")
                     return None
                 self.maps.attr_entry(plan, n)
+            used.update(names)
         notes.append(f"state diff: {len(res['diff'])} changed -> {len(plan)} tests")
+        self.state_names = used
+        return plan
+
+    def slot_use_plan(self, slot: str) -> dict | None:
+        """Tests that ran a line where the tokenizer core slot's value is used: every load of
+        the attribute, except that for `x = <obj>.<slot>` the use lines are the lines of that
+        function that read x. None when a read cannot be followed that way (a string naming
+        the slot outside __slots__, a read outside a function, an unmapped file)."""
+        name = slot.rsplit(".", 1)[-1]
+        word = re.compile(r"\b%s\b" % re.escape(name))
+        for p in sorted((self.root / "tests").rglob("*.py")):
+            try:
+                if word.search(p.read_text(encoding="utf-8")):
+                    return None  # a test may read it itself: its lines are not mapped
+            except OSError:
+                return None
+        lines: dict = {}
+        for rel, src in self.all_sources():
+            if name not in src:
+                continue
+            tree = self._trees.get(rel)
+            if tree is None:
+                try:
+                    tree = self._trees[rel] = ast.parse(src)
+                except SyntaxError:
+                    return None
+            slots_nodes = set()
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__slots__" for t in n.targets):
+                    slots_nodes.update(id(m) for m in ast.walk(n.value))
+            parents = {}
+            for n in ast.walk(tree):
+                for ch in ast.iter_child_nodes(n):
+                    parents[ch] = n
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Constant) and isinstance(n.value, str) and name in n.value \
+                        and id(n) not in slots_nodes:
+                    return None
+                if not (isinstance(n, ast.Attribute) and n.attr == name):
+                    continue
+                par = parents.get(n)
+                if isinstance(n.ctx, ast.Store) and not isinstance(par, ast.AugAssign):
+                    continue
+                if isinstance(n.ctx, ast.Del):
+                    continue
+                fn, p = None, par
+                while p is not None:
+                    if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        fn = p
+                        break
+                    if isinstance(p, ast.ClassDef):
+                        break
+                    p = parents.get(p)
+                if fn is None:
+                    return None
+                use = {n.lineno, n.end_lineno}
+                if isinstance(par, ast.Assign) and par.value is n and \
+                        all(isinstance(t, ast.Name) for t in par.targets):
+                    # the value only moves into the locals: their reads are the uses
+                    names = {t.id for t in par.targets}
+                    use = set()
+                    for m in ast.walk(fn):
+                        if isinstance(m, (ast.Global, ast.Nonlocal)) and names & set(m.names):
+                            return None
+                        if isinstance(m, ast.Name):
+                            if m.id in ("locals", "vars", "eval", "exec"):
+                                return None
+                            if m.id in names and isinstance(m.ctx, ast.Load):
+                                use.add(m.lineno)
+                        if isinstance(m, ast.AugAssign) and isinstance(m.target, ast.Name) \
+                                and m.target.id in names:
+                            use.add(m.lineno)
+                lines.setdefault(rel, set()).update(use)
+        plan: dict = {}
+        for rel, ls in lines.items():
+            if not self.maps.lines.get(rel):
+                return None
+            merge_into(plan, self.maps.cover_lines(rel, sorted(ls)))
         return plan
 
     def _intersect_entries(self, plan: dict, n1: str, n2: str) -> None:
@@ -955,6 +1045,8 @@ class Analyzer:
         self.touched = []
         self.pending = []
         self.nonlocal_change = False
+        self.hard_nonlocal = False
+        self.state_names = None
         plan: dict = {}
         notes: list = []
         files = {}
@@ -973,12 +1065,12 @@ class Analyzer:
             elif rel.startswith("tests/fixtures/"):
                 p, n = self.fixture_change(rel, original, patched)
                 if p:
-                    self.nonlocal_change = True
+                    self.nonlocal_change = self.hard_nonlocal = True
             elif rel.startswith("tests/") and rel.endswith(".py"):
-                self.nonlocal_change = True
+                self.nonlocal_change = self.hard_nonlocal = True
                 p, n = self.test_code_change(rel, original, f["hunks"])
             else:
-                self.nonlocal_change = True
+                self.nonlocal_change = self.hard_nonlocal = True
                 p, n = full_plan(self.maps.read_tests(rel)), [f"{rel}: other file"]
             merge_into_plan_any(plan, p)
             notes += n

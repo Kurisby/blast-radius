@@ -83,7 +83,7 @@ def load_tpcds():
     try:
         with gzip.open(os.path.join(APP, "tpcds.json.gz"), "rt") as fh:
             d = json.load(fh)
-        return {
+        td = {
             "phases": d["phases"],
             "times": {int(k): v for k, v in d["times"].items()},
             "executed": {int(k) for k in d["hashes"]},
@@ -91,6 +91,14 @@ def load_tpcds():
     except Exception as e:  # noqa: BLE001
         log("tpcds data unavailable", repr(e))
         return None
+    try:
+        with gzip.open(os.path.join(APP, "tpcds_attrs.json.gz"), "rt") as fh:
+            a = json.load(fh)
+        td["attr_phases"] = a["phases"]
+        td["attr_other"] = set(a["other"])
+    except Exception as e:  # noqa: BLE001
+        log("tpcds setting profile unavailable", repr(e))
+    return td
 
 
 def tpcds_spec(td, touched, plan_items):
@@ -122,10 +130,47 @@ def tpcds_spec(td, touched, plan_items):
         "parse": sorted((parse - executed) | parse_only),
         "duck": sorted(duck - run),
     }
+    return spec, tpcds_est(td, spec)
+
+
+def tpcds_state_spec(td, names, readers, allowed=None):
+    """TPC-DS phases for a patch whose only effect is changed import-time state: `names` are
+    the profile names of what changed, `readers` those of them that the suite profile saw
+    this test read. Each query gets the check of the phase in which it reads one (build-time
+    profile of the test, per query and phase). None when that profile cannot place a read."""
+    ap = td.get("attr_phases")
+    if ap is None:
+        return None
+    other = td["attr_other"]
+    by = {ph: set() for ph in ("parse", "optimize", "exec", "duck")}
+    for n in names:
+        if n in other:
+            return None
+        hit = False
+        for ph, acc in by.items():
+            it = ap.get(ph, {}).get(n)
+            if it:
+                acc.update(it)
+                hit = True
+        if not hit and n in readers:
+            return None  # read somewhere the phase profile did not see
+    if allowed is not None:  # items the plan says can observe the change
+        by = {ph: acc & allowed for ph, acc in by.items()}
+    executed = td["executed"]
+    run = by["exec"] & executed
+    spec = {
+        "run": sorted(run),
+        "proxy": sorted(((by["parse"] | by["optimize"]) & executed) - run),
+        "parse": sorted(by["parse"] - executed),
+        "duck": sorted((by["duck"] & executed) - run),
+    }
+    return spec, tpcds_est(td, spec)
+
+
+def tpcds_est(td, spec):
     t = td["times"]
-    est = (sum(t.get(i, {}).get("exec", 0.3) for i in spec["run"]) + 0.04 * len(spec["proxy"])
-           + 0.012 * len(spec["duck"]) + 0.005 * len(spec["parse"]) + 0.05)
-    return spec, est
+    return (sum(t.get(i, {}).get("exec", 0.3) for i in spec["run"]) + 0.04 * len(spec["proxy"])
+            + 0.012 * len(spec["duck"]) + 0.005 * len(spec["parse"]) + 0.05)
 
 
 STRONG_GATES = ("tests/test_executor.py::TestExecutor::test_execute_tpch",
@@ -320,8 +365,23 @@ def main() -> None:
                 gate = [maps.id_by_number[o] for o in plan if o != t and (
                     maps.id_by_number[o].startswith("tests/test_executor.py::")
                     or maps.id_by_number[o].split("::")[-1] in ("test_tpcds", "test_tpch", "test_optimize"))]
+                st = None
+                if (td is not None and analyzer.nonlocal_change and not analyzer.hard_nonlocal
+                        and analyzer.state_names is not None and not analyzer.touched):
+                    # only import-time state changed, and the state diff says what
+                    readers = set()
+                    for n in analyzer.state_names:
+                        e = {}
+                        maps.attr_entry(e, n)
+                        if t in e:
+                            readers.add(n)
+                    st = tpcds_state_spec(td, analyzer.state_names, readers,
+                                          set(v) if isinstance(v, set) else None)
                 if td is not None and isinstance(v, set) and not analyzer.nonlocal_change:
                     tspec, est = tpcds_spec(td, analyzer.touched, v)
+                    spec = {"tpcds": tspec, "gate": tpcds_gate(gate, est)}
+                elif st is not None:
+                    tspec, est = st
                     spec = {"tpcds": tspec, "gate": tpcds_gate(gate, est)}
                 else:
                     idxs = spec.get("pool")
@@ -330,7 +390,9 @@ def main() -> None:
                     if idxs is None and td is not None:
                         idxs = sorted(td["executed"])
                     times = td["times"] if td is not None else {}
-                    est = sum(times.get(i, {}).get("exec", 0.3) + times.get(i, {}).get("parse", 0.005)
+                    # (queries the test only parses have no "exec" time)
+                    est = sum(times.get(i, {}).get("exec", 0.0 if td is not None and i not in td["executed"] else 0.3)
+                              + times.get(i, {}).get("parse", 0.005)
                               for i in (idxs or [])) + 0.1 if idxs is not None else 12.5
                     spec["gate"] = tpcds_gate(gate, est)
             if tid.startswith("tests/test_executor.py::"):
