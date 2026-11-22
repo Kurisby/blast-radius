@@ -6,3 +6,4 @@ app/maps.marshal
 app/pkg_import_lines.json
 app/state_fp.json
 app/warm_lines.json
+app/attrs.pkl

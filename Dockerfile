@@ -26,7 +26,7 @@ COPY app /app
 # which modules a warm parent pre-imports, which lines function code runs while every
 # sqlglot module is imported, and a fingerprint of the import-time state that leaves.
 RUN python -m compileall -q /sqlglot/sqlglot /sqlglot/tests /app \
-    && python -c "import sys; sys.path.insert(0, '/app'); import runner; runner.build_pre_rows('/app/pre_rows.pkl'); runner.dump_warm_modules('/app/warm_modules.json'); runner.dump_pkg_import_lines('/app/pkg_import_lines.json'); runner.dump_warm_lines('/app/warm_lines.json'); runner.dump_state_fp('/app/state_fp.json'); import analysis; analysis.compact_maps('/app/maps.json.gz', '/app/maps.marshal')" \
+    && python -c "import sys; sys.path.insert(0, '/app'); import runner; runner.build_pre_rows('/app/pre_rows.pkl'); runner.dump_warm_modules('/app/warm_modules.json'); runner.dump_pkg_import_lines('/app/pkg_import_lines.json'); runner.dump_warm_lines('/app/warm_lines.json'); runner.dump_state_fp('/app/state_fp.json'); import analysis; analysis.compact_maps('/app/maps.json.gz', '/app/maps.marshal'); analysis.compact_attrs('/app/attrs.json.gz', '/app/attrs.pkl')" \
     && chmod -R a+rX /app /sqlglot
 
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1

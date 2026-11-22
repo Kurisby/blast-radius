@@ -3,6 +3,7 @@ fixture items) can observe the change."""
 from __future__ import annotations
 
 import ast
+import bisect
 import gzip
 from array import array
 import json
@@ -79,6 +80,16 @@ class _LazySets(list):
             v = a.tolist()
             list.__setitem__(self, i, v)
         return v
+
+
+def compact_attrs(src: str, out: str) -> None:
+    """Build step: the read profile as a pickle (same content, faster to load)."""
+    import pickle
+
+    with gzip.open(src, "rt") as fh:
+        a = json.load(fh)
+    with open(out, "wb") as fh:
+        pickle.dump(a, fh, protocol=5)
 
 
 def compact_maps(src: str, out: str) -> None:
@@ -252,8 +263,16 @@ class Maps:
         """Build-time read profile of class attributes / class-dict keys, or None."""
         if self._attrs is None:
             try:
-                with gzip.open(self.attrs_path, "rt") as fh:
-                    a = json.load(fh)
+                path = str(self.attrs_path)
+                fast = path[: -len(".json.gz")] + ".pkl" if path.endswith(".json.gz") else ""
+                if fast and os.path.exists(fast):
+                    import pickle
+
+                    with open(fast, "rb") as fh:
+                        a = pickle.load(fh)  # built in the image from the same file: faster to load
+                else:
+                    with gzip.open(path, "rt") as fh:
+                        a = json.load(fh)
                 a["trans"] = [self.number_by_id.get(i) for i in a["ids"]]
                 a["nontest"] = set(a["nontest"])
                 self._attrs = a
@@ -314,13 +333,14 @@ class SrcIndex:
         self.funcs = []    # (body_start, end, node)
         self.lambdas = []  # (start, end, node)
         self.classes = []  # (start, end, node, qualname)
-        self.parent = {}
+        self.headers = []  # (first decorator/def line, body start, node)
 
         def visit(node, qual):
             for child in ast.iter_child_nodes(node):
-                self.parent[child] = node
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     self.funcs.append((child.body[0].lineno, child.end_lineno, child))
+                    self.headers.append((min([child.lineno] + [d.lineno for d in child.decorator_list]),
+                                         child.body[0].lineno, child))
                     visit(child, qual + [child.name, "<locals>"])
                 elif isinstance(child, ast.ClassDef):
                     self.classes.append((child.lineno, child.end_lineno, child, ".".join(qual + [child.name])))
@@ -387,12 +407,10 @@ class SrcIndex:
                     return {"kind": "stmt", "lines": range(first, st.body[0].lineno)}
             return {"kind": "stmt", "lines": range(st.lineno, st.end_lineno + 1), "stmt": st, "func": node}
         # not inside any function body: maybe a def header (decorators/signature)
-        for node in ast.walk(self.tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                first = min([node.lineno] + [d.lineno for d in node.decorator_list])
-                if first <= line < node.body[0].lineno:
-                    return {"kind": "funcdef", "lines": range(node.body[0].lineno, node.end_lineno + 1),
-                            "first": first, "node": node}
+        for first, body_start, node in self.headers:
+            if first <= line < body_start:
+                return {"kind": "funcdef", "lines": range(body_start, node.end_lineno + 1),
+                        "first": first, "node": node}
         cls = self.innermost(self.classes, line)
         if cls is not None:
             node = cls[2]
@@ -427,6 +445,7 @@ class Analyzer:
         self.root = root
         self._src = {}
         self._idx = {}
+        self._starts = {}
         self._all_sources = None
         self.touched = []      # [(rel, lines)] statement-level changes of the last analyze()
         self.nonlocal_change = False
@@ -456,6 +475,14 @@ class Analyzer:
             self._all_sources = res
         return self._all_sources
 
+    def _line_starts(self, rel: str, src: str) -> list:
+        """Offsets where each line of the file starts (line i starts at [i - 1])."""
+        st = self._starts.get(rel)
+        if st is None:
+            st = [0] + [m.end() for m in re.finditer("\n", src)]
+            self._starts[rel] = st
+        return st
+
     # ---- name references ---------------------------------------------------
     def name_refs(self, names, def_path, def_lines):
         """Plan for runtime references to the names, or None when some reference runs at
@@ -467,11 +494,13 @@ class Analyzer:
             if not pat.search(src):
                 continue
             imp = self.maps.import_lines.get(rel, set())
-            for i, text in enumerate(src.split("\n"), start=1):
+            starts = self._line_starts(rel, src)
+            hit_lines = sorted({bisect.bisect_right(starts, m.start()) for m in pat.finditer(src)})
+            for i in hit_lines:
                 if rel == def_path and i in def_lines:
                     continue
-                if not pat.search(text):
-                    continue
+                end = starts[i] - 1 if i < len(starts) else len(src)
+                text = src[starts[i - 1]:end]
                 if text.lstrip().startswith("#"):
                     continue
                 idx = self.index(rel)
