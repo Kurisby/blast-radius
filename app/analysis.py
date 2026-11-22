@@ -141,6 +141,14 @@ class Maps:
             self._bool_files = bf
         self.items_count = {self.trans[int(k)]: v for k, v in m["items"].items() if self.trans[int(k)] is not None}
         self.import_lines = {f: set(v) for f, v in m["import_lines"].items()}
+        self.pkg_import_lines = {}
+        pkg_path = os.environ.get("BR_PKG_LINES", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                               "pkg_import_lines.json"))
+        try:
+            with open(pkg_path) as fh:
+                self.pkg_import_lines = {f: set(v) for f, v in json.load(fh).items()}
+        except (OSError, ValueError):
+            self.pkg_import_lines = None
         self.dialect_files = m["dialect_files"]
         self.all_numbers = frozenset(self.number_by_id.values())
         self.by_test_file: dict[str, set[int]] = {}
@@ -498,7 +506,12 @@ class Analyzer:
                     self.touched.append((rel, [line]))
                     return plan, [f"{rel}:{line} comparison swap {site} -> {len(plan)} infected"]
         plan: dict = {}
-        imp = self.maps.import_lines.get(rel, set())
+        pkg = self.maps.pkg_import_lines
+        if pkg is not None:
+            # lines that function code runs while every module is imported (build-time trace)
+            imp = pkg.get(rel, set())
+        else:
+            imp = self.maps.import_lines.get(rel, set())
         for tag, line in changed_old_lines(hunks):
             locs = [idx.locate(line)]
             if tag == "+":
@@ -509,12 +522,18 @@ class Analyzer:
                     merge_into(plan, self.maps.cover_lines(rel, loc["lines"]))
                     self.touched.append((rel, list(loc["lines"])))
                     notes.append(f"{rel}:{line} {kind}")
-                    if imp and any(l in imp for l in loc["lines"]):
+                    if (kind != "funcdef" or pkg is None) and imp and any(l in imp for l in loc["lines"]):
                         # also runs while modules are imported: whatever it computes there
-                        # (type tables, tries, registries) is shared by every test
+                        # (type tables, tries, registries) is shared by the tests that use it
                         self.nonlocal_change = True
-                        merge_into(plan, full_plan(self.maps.all_numbers))
-                        notes.append(f"{rel}:{line} runs at import time")
+                        if pkg is not None and _dialect_own_module(rel):
+                            # one dialect's module: its import-time state belongs to the
+                            # dialects built on it
+                            merge_into(plan, self.module_fallback(rel))
+                            notes.append(f"{rel}:{line} runs at dialect import")
+                        else:
+                            merge_into(plan, full_plan(self.maps.all_numbers))
+                            notes.append(f"{rel}:{line} runs at import time")
                 elif kind == "none":
                     continue
                 elif kind == "class":
@@ -675,6 +694,13 @@ class Analyzer:
             notes += n
         return plan, notes, (files if ok_overlay else None)
 
+
+def _dialect_own_module(rel: str) -> bool:
+    """sqlglot/{dialects,parsers,generators}/<dialect>.py: one dialect's classes (and its
+    subclasses'), not the shared bases."""
+    parts = rel.split("/")
+    return (len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "parsers", "generators")
+            and parts[2] not in ("__init__.py", "dialect.py", "base.py", "python.py"))
 
 _SWAPS = {
     (ast.Is, ast.Eq): ("EQNI", "ISNE", "ERR"), (ast.Eq, ast.Is): ("EQNI", "ISNE", "ERR"),

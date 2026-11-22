@@ -120,6 +120,49 @@ def dump_warm_modules(path: str) -> None:
         json.dump(res, fh)
 
 
+_PKG_LINES_CODE = r"""
+import importlib, json, os, pkgutil, sys
+root = os.getcwd() + "/"
+src = root + "sqlglot/"
+mon = sys.monitoring
+seen = set()
+def on_line(code, line):
+    # function bodies only (CO_OPTIMIZED): a module or class body evaluating a lambda or a
+    # def on some line does not run that function
+    fn = code.co_filename
+    if fn.startswith(src):
+        if code.co_flags & 1:
+            seen.add((fn[len(root):], line))
+        return mon.DISABLE
+mon.use_tool_id(3, "pkglines")
+mon.register_callback(3, mon.events.LINE, on_line)
+mon.set_events(3, mon.events.LINE)
+import sqlglot
+for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+    if m.name.endswith("__main__"):
+        continue
+    try:
+        importlib.import_module(m.name)
+    except Exception:
+        pass
+mon.set_events(3, 0)
+out = {}
+for f, l in seen:
+    out.setdefault(f, []).append(l)
+json.dump({f: sorted(v) for f, v in out.items()}, open(sys.argv[1], "w"))
+"""
+
+
+def dump_pkg_import_lines(path: str) -> None:
+    """Build step: lines of sqlglot that run while every sqlglot module is imported (pinned
+    commit). Profiled coverage misses most of them: the package was imported before line
+    tracing started, and dialect modules are imported lazily inside whichever test came first."""
+    import subprocess
+
+    subprocess.run([sys.executable, "-c", _PKG_LINES_CODE, path], cwd=ROOT, check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 class _Timeout(BaseException):
     pass
 
