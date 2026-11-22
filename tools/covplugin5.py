@@ -25,6 +25,7 @@ SRC = ROOT + "sqlglot/"
 OUTDIR = os.environ["COV_OUTDIR"]
 LINES = os.environ.get("COV_LINES") == "1"
 CMP = os.environ.get("COV_CMP") == "1"
+BOOL = os.environ.get("COV_BOOL") == "1"
 MAIN = threading.main_thread().ident
 _get_ident = threading.get_ident
 mon = sys.monitoring
@@ -37,7 +38,7 @@ _base_rec = None
 
 
 def _new():
-    return {"lines": set(), "funcs": set(), "reads": set(), "classes": set(), "cmp": set()}
+    return {"lines": set(), "funcs": set(), "reads": set(), "classes": set(), "cmp": set(), "bool": set()}
 
 
 def _set_ctx(name):
@@ -98,6 +99,8 @@ def __brcmp__(site, l, r):
                 cls = "ISNE"
             elif eq and not ident:
                 cls = "EQNI"
+            elif k in ("eq", "ne"):
+                cls = "OK"  # evaluated: an == / != swap flips it
         else:
             try:
                 lt = l < r
@@ -121,6 +124,169 @@ def __brcmp__(site, l, r):
 
 
 builtins.__brcmp__ = __brcmp__
+
+
+# ---------------------------------------------------------------- boolean formula profile
+# A formula is a tree of `and` / `or` / `not` over leaf expressions, used for its truth
+# value (if / while / assert / conditional expression / comprehension filter). Its leaves
+# are all side-effect free, so the ones the original short-circuits past are evaluated too:
+# the vector of every leaf's truth value (1/0, or E if evaluating it raised) is recorded.
+def __brbool__(site, shape, leaves):
+    vals = [None] * len(leaves)
+
+    def ev(node):
+        kind = node[0]
+        if kind == "L":
+            i = node[1]
+            vals[i] = "E"  # stays E if evaluating the leaf raises
+            v = leaves[i]()
+            vals[i] = 1 if v else 0
+            return vals[i]
+        if kind == "N":
+            return 0 if ev(node[1]) else 1
+        if kind == "A":
+            for c in node[1]:
+                if not ev(c):
+                    return 0
+            return 1
+        for c in node[1]:
+            if ev(c):
+                return 1
+        return 0
+
+    try:
+        res = ev(shape)  # original semantics, exceptions propagate (after recording)
+    except BaseException:
+        _record_bool(site, leaves, vals)
+        raise
+    _record_bool(site, leaves, vals)
+    return bool(res)
+
+
+def _record_bool(site, leaves, vals):
+    if not getattr(_tl, "busy", False):
+        _tl.busy = True
+        try:
+            vec = []
+            for i, v in enumerate(vals):
+                if v is None:
+                    try:
+                        v = 1 if leaves[i]() else 0
+                    except BaseException:  # noqa: BLE001
+                        v = "E"
+                vec.append(str(v))
+            _r()["bool"].add((site, "".join(vec)))
+        finally:
+            _tl.busy = False
+
+
+builtins.__brbool__ = __brbool__
+
+_PURE_FUNCS = {"isinstance", "len", "type", "bool", "callable", "hasattr", "issubclass", "id", "getattr",
+               "str", "int", "tuple", "frozenset", "any", "all"}
+_PURE_METHODS = {"get", "startswith", "endswith", "isdigit", "isalpha", "isalnum", "isspace", "isupper",
+                 "islower", "upper", "lower", "strip", "is_type", "is_int", "is_number", "is_string",
+                 "is_star", "find", "find_ancestor", "text", "name", "keys", "values", "items",
+                 "is_leaf", "isidentifier", "count", "index"}
+
+
+def _pure(n):
+    if isinstance(n, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(n, ast.Attribute):
+        return _pure(n.value)
+    if isinstance(n, ast.Subscript):
+        return _pure(n.value) and _pure(n.slice)
+    if isinstance(n, ast.Slice):
+        return all(x is None or _pure(x) for x in (n.lower, n.upper, n.step))
+    if isinstance(n, (ast.Tuple, ast.List, ast.Set)):
+        return all(_pure(e) for e in n.elts)
+    if isinstance(n, ast.Compare):
+        return _pure(n.left) and all(_pure(c) for c in n.comparators)
+    if isinstance(n, ast.BoolOp):
+        return all(_pure(v) for v in n.values)
+    if isinstance(n, ast.UnaryOp):
+        return _pure(n.operand)
+    if isinstance(n, ast.BinOp):
+        return _pure(n.left) and _pure(n.right)
+    if isinstance(n, ast.Call):
+        if n.keywords and not all(_pure(k.value) for k in n.keywords):
+            return False
+        if not all(_pure(a) and not isinstance(a, ast.Starred) for a in n.args):
+            return False
+        if isinstance(n.func, ast.Name):
+            return n.func.id in _PURE_FUNCS
+        if isinstance(n.func, ast.Attribute):
+            return n.func.attr in _PURE_METHODS and _pure(n.func.value)
+        return False
+    return False
+
+
+def _formula(node, leaves):
+    if isinstance(node, ast.BoolOp):
+        return ("A" if isinstance(node.op, ast.And) else "O", tuple(_formula(v, leaves) for v in node.values))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return ("N", _formula(node.operand, leaves))
+    leaves.append(node)
+    return ("L", len(leaves) - 1)
+
+
+class _Bool(ast.NodeTransformer):
+    def __init__(self, rel):
+        self.rel = rel
+        self.depth = 0
+
+    def visit_FunctionDef(self, node):
+        self.depth += 1
+        self.generic_visit(node)
+        self.depth -= 1
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def _wrap(self, test):
+        if self.depth == 0 or test is None:
+            return test
+        root = test
+        if isinstance(root, ast.UnaryOp) and isinstance(root.op, ast.Not):
+            inner = root.operand
+            if not isinstance(inner, ast.BoolOp):
+                return test
+        elif not isinstance(root, ast.BoolOp):
+            return test
+        leaves = []
+        shape = _formula(root, leaves)
+        if not all(_pure(l) for l in leaves) or len(leaves) > 12:
+            return test
+        site = f"{self.rel}:{root.lineno}:{root.col_offset}"
+        lams = [ast.Lambda(args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[],
+                                              defaults=[]), body=l) for l in leaves]
+        call = ast.Call(func=ast.Name(id="__brbool__", ctx=ast.Load()),
+                        args=[ast.Constant(site), ast.Constant(shape), ast.List(elts=lams, ctx=ast.Load())],
+                        keywords=[])
+        return ast.copy_location(call, root)
+
+    def visit_If(self, node):
+        self.generic_visit(node)
+        node.test = self._wrap(node.test)
+        return node
+
+    visit_While = visit_If
+
+    def visit_IfExp(self, node):
+        self.generic_visit(node)
+        node.test = self._wrap(node.test)
+        return node
+
+    def visit_Assert(self, node):
+        self.generic_visit(node)
+        node.test = self._wrap(node.test)
+        return node
+
+    def visit_comprehension(self, node):
+        self.generic_visit(node)
+        node.ifs = [self._wrap(t) for t in node.ifs]
+        return node
 
 _OPS = {ast.Is: "is", ast.IsNot: "in", ast.Eq: "eq", ast.NotEq: "ne", ast.Lt: "lt", ast.LtE: "le",
         ast.Gt: "gt", ast.GtE: "ge"}
@@ -160,7 +326,10 @@ class _Loader(importlib.abc.SourceLoader):
 
     def source_to_code(self, data, path, *, _optimize=-1):
         tree = ast.parse(data, filename=path)
-        tree = _Cmp(path[len(ROOT):]).visit(tree)
+        if CMP:
+            tree = _Cmp(path[len(ROOT):]).visit(tree)
+        if BOOL:
+            tree = _Bool(path[len(ROOT):]).visit(tree)
         ast.fix_missing_locations(tree)
         return compile(tree, path, "exec", dont_inherit=True)
 
@@ -192,7 +361,7 @@ class _Finder(importlib.abc.MetaPathFinder):
             fullname, origin, loader=loader, submodule_search_locations=spec.submodule_search_locations)
 
 
-if CMP and not any(isinstance(f, _Finder) for f in sys.meta_path):
+if (CMP or BOOL) and not any(isinstance(f, _Finder) for f in sys.meta_path):
     sys.meta_path.insert(0, _Finder())
 
 
@@ -278,6 +447,7 @@ def _ser(rec):
     out["reads"] = sorted(rec["reads"])
     out["classes"] = sorted(rec["classes"])
     out["cmp"] = sorted(f"{s}|{c}" for s, c in rec["cmp"])
+    out["bool"] = sorted(f"{s}|{c}" for s, c in rec["bool"])
     return out
 
 

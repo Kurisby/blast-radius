@@ -90,6 +90,12 @@ def compact_maps(src: str, out: str) -> None:
         cmp_by_file.setdefault(site.split(":")[0], {})[site] = v
     m["cmp_files"] = {f: marshal.dumps(v) for f, v in cmp_by_file.items()}
     m.pop("cmp", None)
+    bool_by_file: dict = {}
+    for site, v in (m.get("bool") or {}).items():
+        bool_by_file.setdefault(site.split(":")[0], {})[site] = v
+    if "bool" in m:
+        m["bool_files"] = {f: marshal.dumps(v) for f, v in bool_by_file.items()}
+        m.pop("bool", None)
     m["sets"] = [array("I", v).tobytes() for v in m["sets"]]
     m["format"] = "compact1"
     with open(out, "wb") as fh:
@@ -123,6 +129,16 @@ class Maps:
         self.classes_items = m.get("classes_items") or {}
         self.cmp = m.get("cmp")
         self.cmp_nontest = set(m.get("cmp_nontest") or ())
+        self.cmp_ok = bool(m.get("cmp_ok"))
+        self.has_bool = "bool_files" in m or "bool" in m
+        self.bool_nontest = set(m.get("bool_nontest") or ())
+        if self._cmp_files is not None:
+            self._bool_files = _LazyFiles(m.get("bool_files") or {})
+        else:
+            bf: dict = {}
+            for site, v in (m.get("bool") or {}).items():
+                bf.setdefault(site.split(":")[0], {})[site] = v
+            self._bool_files = bf
         self.items_count = {self.trans[int(k)]: v for k, v in m["items"].items() if self.trans[int(k)] is not None}
         self.import_lines = {f: set(v) for f, v in m["import_lines"].items()}
         self.dialect_files = m["dialect_files"]
@@ -185,6 +201,18 @@ class Maps:
         for c in classes:
             e = entries.get(c)
             if e:
+                self._add_entry(plan, e)
+        return plan
+
+    def bool_plan(self, site: str, infected) -> dict | None:
+        """Plan of tests/items in which the formula at site saw a leaf vector for which
+        infected(vector) is true (None when the profile cannot answer)."""
+        if not self.has_bool or site in self.bool_nontest:
+            return None
+        plan: dict = {}
+        entries = (self._bool_files.get(site.split(":")[0]) or {}).get(site) or {}
+        for vec, e in entries.items():
+            if infected(vec):
                 self._add_entry(plan, e)
         return plan
 
@@ -449,7 +477,18 @@ class Analyzer:
             return self.module_fallback(rel), [f"{rel}: original unparsable"]
         swap = None
         if len(added) == 1 and len(removed) == 1 and _OP_RE.search(removed[0]) and _OP_RE.search(added[0]):
-            swap = cmp_swap(original, patched, idx.tree)
+            swap = cmp_swap(original, patched, idx.tree, flips=self.maps.cmp_ok)
+        if (swap is None and len(added) == 1 and len(removed) == 1
+                and _ANDOR_RE.search(removed[0]) and _ANDOR_RE.search(added[0])):
+            bswap = bool_swap(original, patched, idx.tree)
+            if bswap is not None:
+                site, line, infected = bswap
+                loc = idx.locate(line)
+                if loc["kind"] in ("func", "stmt", "funcdef"):
+                    plan = self.maps.bool_plan(f"{rel}:{site}", infected)
+                    if plan is not None:
+                        self.touched.append((rel, [line]))
+                        return plan, [f"{rel}:{line} and/or swap {site} -> {len(plan)} infected"]
         if swap is not None:
             site, line, classes = swap
             loc = idx.locate(line)
@@ -643,12 +682,14 @@ _SWAPS = {
     (ast.Lt, ast.LtE): ("EQ", "ERR"), (ast.LtE, ast.Lt): ("EQ", "ERR"),
     (ast.Gt, ast.GtE): ("EQ", "ERR"), (ast.GtE, ast.Gt): ("EQ", "ERR"),
 }
+# == <-> != flips every evaluation: usable only with a profile that records each one ("OK")
+_FLIPS = {(ast.Eq, ast.NotEq): ("OK", "EQNI", "ISNE", "ERR"), (ast.NotEq, ast.Eq): ("OK", "EQNI", "ISNE", "ERR")}
 _OP_RE = re.compile(r"==|!=|<|>|\bis\b")
 _OPNAME = {ast.Is: "is", ast.IsNot: "in", ast.Eq: "eq", ast.NotEq: "ne", ast.Lt: "lt", ast.LtE: "le",
            ast.Gt: "gt", ast.GtE: "ge"}
 
 
-def cmp_swap(original: str, patched: str, orig_tree=None):
+def cmp_swap(original: str, patched: str, orig_tree=None, flips=False):
     """If the patch only swaps the operator of one profiled comparison between two operators
     that differ on a single outcome class (is/==, is not/!=, </<=, >/>=), return
     ("line:col:op", line, outcome classes that tell them apart)."""
@@ -673,7 +714,7 @@ def cmp_swap(original: str, patched: str, orig_tree=None):
         if nb is None or len(na.ops) != 1 or len(nb.ops) != 1:
             continue
         pair = (type(na.ops[0]), type(nb.ops[0]))
-        if pair[0] is pair[1] or pair not in _SWAPS:
+        if pair[0] is pair[1] or (pair not in _SWAPS and not (flips and pair in _FLIPS)):
             continue
         if any(isinstance(x, ast.Constant) and x.value is None for x in (na.left, na.comparators[0])):
             continue
@@ -693,7 +734,178 @@ def cmp_swap(original: str, patched: str, orig_tree=None):
             or ast.dump(na.left) != ast.dump(nb.left)
             or ast.dump(na.comparators[0]) != ast.dump(nb.comparators[0])):
         return None
-    return f"{k[0]}:{k[1]}:{_OPNAME[pair[0]]}", line, _SWAPS[pair]
+    return f"{k[0]}:{k[1]}:{_OPNAME[pair[0]]}", line, _SWAPS.get(pair) or _FLIPS[pair]
+
+
+_ANDOR_RE = re.compile(r"\b(and|or)\b")
+_PURE_FUNCS = {"isinstance", "len", "type", "bool", "callable", "hasattr", "issubclass", "id", "getattr",
+               "str", "int", "tuple", "frozenset", "any", "all"}
+_PURE_METHODS = {"get", "startswith", "endswith", "isdigit", "isalpha", "isalnum", "isspace", "isupper",
+                 "islower", "upper", "lower", "strip", "is_type", "is_int", "is_number", "is_string",
+                 "is_star", "find", "find_ancestor", "text", "name", "keys", "values", "items",
+                 "is_leaf", "isidentifier", "count", "index"}
+
+
+def _pure(n) -> bool:
+    """Same rule as the profiler: leaves it may evaluate speculatively."""
+    if isinstance(n, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(n, ast.Attribute):
+        return _pure(n.value)
+    if isinstance(n, ast.Subscript):
+        return _pure(n.value) and _pure(n.slice)
+    if isinstance(n, ast.Slice):
+        return all(x is None or _pure(x) for x in (n.lower, n.upper, n.step))
+    if isinstance(n, (ast.Tuple, ast.List, ast.Set)):
+        return all(_pure(e) for e in n.elts)
+    if isinstance(n, ast.Compare):
+        return _pure(n.left) and all(_pure(c) for c in n.comparators)
+    if isinstance(n, ast.BoolOp):
+        return all(_pure(v) for v in n.values)
+    if isinstance(n, ast.UnaryOp):
+        return _pure(n.operand)
+    if isinstance(n, ast.BinOp):
+        return _pure(n.left) and _pure(n.right)
+    if isinstance(n, ast.Call):
+        if n.keywords and not all(_pure(k.value) for k in n.keywords):
+            return False
+        if not all(_pure(a) and not isinstance(a, ast.Starred) for a in n.args):
+            return False
+        if isinstance(n.func, ast.Name):
+            return n.func.id in _PURE_FUNCS
+        if isinstance(n.func, ast.Attribute):
+            return n.func.attr in _PURE_METHODS and _pure(n.func.value)
+        return False
+    return False
+
+
+def _formula(node, leaves):
+    if isinstance(node, ast.BoolOp):
+        return ("A" if isinstance(node.op, ast.And) else "O", tuple(_formula(v, leaves) for v in node.values))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return ("N", _formula(node.operand, leaves))
+    leaves.append(node)
+    return ("L", len(leaves) - 1)
+
+
+def _formula_roots(tree):
+    """Profiled formula roots: tests of if/while/assert/conditional expressions and
+    comprehension filters inside functions, rooted at a BoolOp or `not` of a BoolOp."""
+    roots = []
+
+    def is_root(t):
+        if isinstance(t, ast.BoolOp):
+            return True
+        return isinstance(t, ast.UnaryOp) and isinstance(t.op, ast.Not) and isinstance(t.operand, ast.BoolOp)
+
+    def visit(node, in_func):
+        for child in ast.iter_child_nodes(node):
+            f = in_func or isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            tests = []
+            if isinstance(child, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+                tests = [child.test]
+            elif isinstance(child, ast.comprehension):
+                tests = list(child.ifs)
+            if f:
+                roots.extend(t for t in tests if is_root(t))
+            visit(child, f)
+
+    visit(tree, False)
+    return roots
+
+
+def _eval_shape(shape, vec):
+    """Truth value of a formula under leaf values '0'/'1'/'E' (E: evaluating raises)."""
+    kind = shape[0]
+    if kind == "L":
+        v = vec[shape[1]]
+        if v == "E":
+            raise _LeafError
+        return v == "1"
+    if kind == "N":
+        return not _eval_shape(shape[1], vec)
+    if kind == "A":
+        return all(_eval_shape(c, vec) for c in shape[1])
+    return any(_eval_shape(c, vec) for c in shape[1])
+
+
+class _LeafError(Exception):
+    pass
+
+
+def _outcome(shape, vec):
+    try:
+        return _eval_shape(shape, vec)
+    except _LeafError:
+        return "E"
+
+
+def bool_swap(original: str, patched: str, orig_tree=None):
+    """If the patch only changes and/or operators of one profiled formula (same leaves),
+    return ("line:col", line, infected(vector) predicate)."""
+    a = original.split("\n")
+    b = patched.split("\n")
+    if len(a) != len(b):
+        return None
+    diff = [i for i in range(len(a)) if a[i] != b[i]]
+    if len(diff) != 1:
+        return None
+    line = diff[0] + 1
+    try:
+        ta = orig_tree if orig_tree is not None else ast.parse(original)
+        tb = ast.parse(patched)
+    except SyntaxError:
+        return None
+    ra = [r for r in _formula_roots(ta) if r.lineno <= line <= r.end_lineno]
+    if len(ra) != 1:
+        return None
+    root_a = ra[0]
+    rb = [r for r in _formula_roots(tb) if (r.lineno, r.col_offset) == (root_a.lineno, root_a.col_offset)]
+    if len(rb) != 1:
+        return None
+    root_b = rb[0]
+    la, lb = [], []
+    sa = _formula(root_a, la)
+    sb = _formula(root_b, lb)
+    if len(la) != len(lb) or len(la) > 12 or not all(_pure(x) for x in la):
+        return None
+    if any(ast.dump(x) != ast.dump(y) for x, y in zip(la, lb)):
+        return None
+    if sa == sb:
+        return None
+    # nothing else on the line may differ: compare the line with the formula's text masked
+    if root_a.end_lineno == root_a.lineno == root_b.end_lineno:
+        pa, pb = a[line - 1].encode("utf-8"), b[line - 1].encode("utf-8")
+        if pa[: root_a.col_offset] != pb[: root_b.col_offset] or pa[root_a.end_col_offset:] != pb[root_b.end_col_offset:]:
+            return None
+    else:
+        # multi-line formula: the outside of the formula is unchanged when the rest of the
+        # trees match with the formula removed
+        def strip(tree, root):
+            for node in ast.walk(tree):
+                for field, value in ast.iter_fields(node):
+                    if value is root:
+                        setattr(node, field, ast.Constant(True))
+                        return field, node, value
+            return None
+        ra_saved = strip(ta, root_a)
+        rb_saved = strip(tb, root_b)
+        try:
+            same = ra_saved is not None and rb_saved is not None and ast.dump(ta) == ast.dump(tb)
+        finally:
+            for saved in (ra_saved, rb_saved):
+                if saved is not None:
+                    field, node, value = saved
+                    setattr(node, field, value)
+        if not same:
+            return None
+
+    def infected(vec, sa=sa, sb=sb):
+        if len(vec) != len(la):
+            return True
+        return _outcome(sa, vec) != _outcome(sb, vec)
+
+    return f"{root_a.lineno}:{root_a.col_offset}", line, infected
 
 
 def merge_into_plan_any(plan, add):

@@ -1,6 +1,7 @@
 """Merge coverage v4 dumps into the compact selection map shipped in the image."""
 import json, glob, collections, os, sys, gzip
 covdir, cmpdir, tests_json, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+booldir = sys.argv[5] if len(sys.argv) > 5 else ""
 min_item_secs = 0.0
 tests = json.load(open(tests_json))["tests"]
 ids = [t["id"] for t in tests]
@@ -70,6 +71,24 @@ for p in [q for d in cmpdir.split(",") for q in glob.glob(os.path.join(d, "*.jso
                 C_item[(site, cls)][n].add(int(item))
             else:
                 C_glob[(site, cls)].add(n)
+B_all = collections.defaultdict(set); B_glob = collections.defaultdict(set)
+B_item = collections.defaultdict(lambda: collections.defaultdict(set))
+bool_nontest = set()
+for p in [q for d in booldir.split(",") if d for q in glob.glob(os.path.join(d, "*.json"))]:
+    d = json.load(open(p))
+    for ctx, rec in d.items():
+        base, _, item = ctx.partition("#")
+        n = idx.get(base)
+        for x in rec.get("bool", ()):
+            site, vec = x.split("|")
+            if n is None:
+                bool_nontest.add(site)
+                continue
+            B_all[(site, vec)].add(n)
+            if item:
+                B_item[(site, vec)][n].add(int(item))
+            else:
+                B_glob[(site, vec)].add(n)
 pool = {}
 def sid(s):
     k = tuple(sorted(s))
@@ -104,6 +123,15 @@ for (site, cls), st in C_all.items():
         entry.append({str(t): sid(v) for t, v in C_item[(site, cls)].items()})
     cmp_out[site][cls] = entry
 m["cmp"] = cmp_out
+if booldir:
+    bool_out = collections.defaultdict(dict)
+    for (site, vec), st in B_all.items():
+        entry = [sid(st), sid(B_glob.get((site, vec), ()))]
+        if (site, vec) in B_item:
+            entry.append({str(t): sid(v) for t, v in B_item[(site, vec)].items()})
+        bool_out[site][vec] = entry
+    m["bool"] = bool_out
+    m["bool_nontest"] = sorted(bool_nontest)
 m["cmp_nontest"] = sorted(cmp_nontest)
 m["sets"] = [list(k) for k in sorted(pool, key=pool.get)]
 with gzip.open(out, "wt", compresslevel=9) as fh:
