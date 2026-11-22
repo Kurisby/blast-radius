@@ -145,6 +145,9 @@ def tpcds_spec(td, touched, plan_items):
         # the optimizer runs none of the changed lines for these: its output is the pinned
         # one (recorded), so only the pretty SQL (if it runs them) is checked on it
         "optfree": sorted(((pretty | cgen) - opt) & proxy),
+        # runs whose optimizer (and parser) run none of the changed lines: the run may take
+        # the recorded optimizer output instead of optimizing again
+        "runfree": sorted((items("exec") & allowed & executed) - opt - parse),
     }
     return spec, tpcds_est(td, spec)
 

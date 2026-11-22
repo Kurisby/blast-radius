@@ -752,6 +752,40 @@ def tpcds_opt():
     return _TPCDS_OPT["d"]
 
 
+_OPT_HITS = [0]
+_OPT_SKIP = {}  # parsed-query hash -> recorded optimizer output (JSON dump), for this run
+
+
+def _install_opt_skip():
+    """execute() optimizes every query it runs; a query whose parser and optimizer run none
+    of the changed lines gets the recorded (pinned) optimizer output instead."""
+    import hashlib
+    import json as _json
+
+    import sqlglot.executor as sx
+    from sqlglot import exp as _e
+    from sqlglot.serde import dump, load
+
+    orig = sx.optimize
+    if getattr(orig, "_br_skip", False):
+        return
+
+    def optimize(expression, *a, **k):
+        if _OPT_SKIP and isinstance(expression, _e.Expr):
+            try:
+                h = hashlib.sha1(_json.dumps(dump(expression), sort_keys=True, default=str).encode()).hexdigest()
+                d = _OPT_SKIP.get(h)
+                if d is not None:
+                    _OPT_HITS[0] += 1
+                    return load(_json.loads(d))
+            except Exception:  # noqa: BLE001
+                pass
+        return orig(expression, *a, **k)
+
+    optimize._br_skip = True
+    sx.optimize = optimize
+
+
 def _code_key(co):
     """Everything of a code object that decides what it does (not its file or line table)."""
     import types as _types
@@ -1190,8 +1224,19 @@ class TestHooks:
             self.out.write(f"NOTE tpcds duckdb checked {len(duck_new)} items\n")
         if not run:
             return "pass"
+        _OPT_SKIP.clear()
+        skip = (set(plan.get("runfree", ())) | set(plan.get("optfree", ()))) - phash_changed
+        rec = tpcds_opt()
+        for i in run & skip:
+            if rec.get(i) is not None and TPCDS_PHASHES.get(i):
+                _OPT_SKIP[TPCDS_PHASHES[i]] = rec[i]
+        if _OPT_SKIP:
+            try:
+                _install_opt_skip()
+            except Exception:  # noqa: BLE001
+                _OPT_SKIP.clear()
         test.tpcds_sqls = [x for j, x in enumerate(sqls) if j in run]
-        self.out.write(f"NOTE tpcds running {len(run)} items\n")
+        self.out.write(f"NOTE tpcds running {len(run)} items ({len(_OPT_SKIP)} with the recorded optimizer output)\n")
         return None
 
     def start(self, tid, test):
