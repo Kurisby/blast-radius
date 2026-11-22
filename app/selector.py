@@ -46,7 +46,7 @@ SAFETY = float(os.environ.get("BR_SAFETY", "1.4"))
 P_FAIL_LIKELY = float(os.environ.get("BR_P_LIKELY", "0.95"))  # changed optimizer fixture item: its reader almost always fails
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.05"))
 SIM_SLOW = float(os.environ.get("BR_SIM_SLOW", "1"))  # local test only: act as if CPU were this much slower
-BUDGET_MULT = float(os.environ.get("BR_BUDGET_MULT", "2.5"))  # 0: budget is the listing cost alone
+BUDGET_MULT = float(os.environ.get("BR_BUDGET_MULT", "6"))  # probe: looser job budgets  # 0: budget is the listing cost alone
 
 
 def log(*a):
