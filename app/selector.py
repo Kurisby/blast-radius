@@ -127,6 +127,21 @@ def tpcds_spec(td, touched, plan_items):
     return spec, est
 
 
+STRONG_GATES = ("tests/test_executor.py::TestExecutor::test_execute_tpch",
+                "tests/test_executor.py::TestExecutor::test_optimized_tpch")
+
+
+def tpcds_gate(gate, est):
+    """Tests whose failure settles the TPC-DS executor test as failing without running it.
+    Listing it costs ~21 s whenever it would have passed, so a gate only pays off when the
+    run is costly and the gate test is a close proxy (the other TPC executor tests)."""
+    if est <= 3.0:
+        return []
+    if est <= 10.0:
+        return [g for g in gate if g in STRONG_GATES]
+    return gate
+
+
 def dialects_for(files: dict, dialect_files: dict) -> list[str] | None:
     """Dialects whose class hierarchy includes a changed module (None = all)."""
     res = set()
@@ -168,7 +183,8 @@ def choose_split(cand, ests, seconds, duration_ms, maps, likely):
     order = sorted(cand, key=lambda t: (-(1.0 if t in likely else 0.0),
                                         -(ests[t] + 0.01) / (seconds[t] + 0.01)))
     n = len(order)
-    ks = sorted({0, n} | {min(n, 2 ** i) for i in range(0, 12)} | {k for k in range(0, min(n, 12) + 1)})
+    ks = sorted({0, n} | {min(n, 2 ** i) for i in range(0, 12)} | {k for k in range(0, min(n, 12) + 1)}
+                | {max(0, n - 2 ** i) for i in range(0, 12)} | {max(0, n - k) for k in range(0, 13)})
     best = None
     for k in ks:
         blind = set(order[:k])
@@ -262,7 +278,7 @@ def main() -> None:
                     or maps.id_by_number[o].split("::")[-1] in ("test_tpcds", "test_tpch", "test_optimize"))]
                 if td is not None and isinstance(v, set) and not analyzer.nonlocal_change:
                     tspec, est = tpcds_spec(td, analyzer.touched, v)
-                    spec = {"tpcds": tspec, "gate": gate}
+                    spec = {"tpcds": tspec, "gate": tpcds_gate(gate, est)}
                 else:
                     idxs = spec.get("pool")
                     if spec.get("pairs") is not None:
@@ -272,7 +288,7 @@ def main() -> None:
                     times = td["times"] if td is not None else {}
                     est = sum(times.get(i, {}).get("exec", 0.3) + times.get(i, {}).get("parse", 0.005)
                               for i in (idxs or [])) + 0.1 if idxs is not None else 12.5
-                    spec["gate"] = gate
+                    spec["gate"] = tpcds_gate(gate, est)
             if tid.startswith("tests/test_executor.py::"):
                 has_exec = True
             spec["_est"] = round(est, 4)
