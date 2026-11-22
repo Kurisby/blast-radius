@@ -295,7 +295,12 @@ def apply_hotpatch(patches: dict) -> int:
 
     want = {}
     need = set()
+    # a patched module this process never imported loads the patched file from the overlay
+    # when first imported (a parent that skipped the warm import): nothing to swap there
+    loaded = {getattr(m, "__file__", None) for m in list(sys.modules.values())}
     for path, swaps in patches.items():
+        if path not in loaded:
+            continue
         for qn, fl, a, b in swaps:
             want.setdefault((path, qn, fl), []).append((a, b))
             # a function that is not nested in another one was created at import time: it
