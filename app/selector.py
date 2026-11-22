@@ -142,6 +142,9 @@ def tpcds_spec(td, touched, plan_items):
         "duck": sorted(duck - run),
         "duckrun": sorted(duckrun),
         "cg": sorted(cgen & proxy),
+        # the optimizer runs none of the changed lines for these: its output is the pinned
+        # one (recorded), so only the pretty SQL (if it runs them) is checked on it
+        "optfree": sorted(((pretty | cgen) - opt) & proxy),
     }
     return spec, tpcds_est(td, spec)
 
@@ -424,6 +427,8 @@ def main() -> None:
                                                    - run - set(both["proxy"]))
                             both["pretty"] = sorted(set(lspec.get("pretty", ())) & set(both["proxy"]))
                             both["cg"] = sorted(set(lspec.get("cg", ())) & set(both["proxy"]))
+                            both["optfree"] = sorted(set(lspec.get("optfree", ())) & set(both["proxy"])
+                                                     - set(sspec["proxy"]) - set(sspec.get("phash", ())))
                             both["parse"] = sorted(set(sspec["parse"]) | set(lspec["parse"]))
                             st = (both, tpcds_est(td, both))
                 if td is not None and isinstance(v, set) and not analyzer.nonlocal_change:

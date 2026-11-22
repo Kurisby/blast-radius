@@ -735,6 +735,23 @@ def tpcds_codegen():
     return _TPCDS_CG["d"]
 
 
+_TPCDS_OPT = {}
+
+
+def tpcds_opt():
+    """Serde dumps (JSON text) of the optimizer output per TPC-DS query at the pinned commit."""
+    if "d" not in _TPCDS_OPT:
+        try:
+            import gzip
+            import json as _json
+            with gzip.open(os.path.join(APP, "tpcds_opt.json.gz"), "rt") as fh:
+                _TPCDS_OPT["d"] = {int(k): v for k, v in _json.load(fh).items()}
+        except Exception as e:  # noqa: BLE001
+            log("tpcds optimizer record unavailable", repr(e))
+            _TPCDS_OPT["d"] = {}
+    return _TPCDS_OPT["d"]
+
+
 def _code_key(co):
     """Everything of a code object that decides what it does (not its file or line table)."""
     import types as _types
@@ -1079,6 +1096,7 @@ class TestHooks:
             return hashlib.sha1(_json.dumps(dump(e), sort_keys=True, default=str).encode()).hexdigest()
 
         proxy = list(plan.get("proxy", ()))
+        phash_changed = set()
         for i in plan.get("phash", ()):
             if i in run:
                 continue
@@ -1088,6 +1106,7 @@ class TestHooks:
                 return "fail"  # the parent parses every query before any runs
             if h != TPCDS_PHASHES.get(i):
                 proxy.append(i)
+                phash_changed.add(i)
         # (the replay is the cheaper check: a query it sends to a run skips the optimizer proxy)
         cgen = [i for i in plan.get("cg", ()) if i not in run]
         if cgen:
@@ -1101,12 +1120,20 @@ class TestHooks:
                     run.add(i)
             self.out.write(f"NOTE tpcds codegen replayed {len(cgen)} items\n")
         pretty = set(plan.get("pretty", ()))
+        optfree = set(plan.get("optfree", ())) - phash_changed
         for i in proxy:
             if i in run:
                 continue
             try:
-                e = pickle.loads(pickle.dumps(parse_one(sqls[i][1])))
-                o = optimize(e, ensure_schema(helpers.TPCDS_SCHEMA), leave_tables_isolated=True, dialect=None)
+                d = tpcds_opt().get(i) if i in optfree else None
+                if d is not None:
+                    if i not in pretty:
+                        continue  # nothing that runs the change touches the optimizer output
+                    from sqlglot.serde import load as _load
+                    o = _load(_json.loads(d))
+                else:
+                    e = pickle.loads(pickle.dumps(parse_one(sqls[i][1])))
+                    o = optimize(e, ensure_schema(helpers.TPCDS_SCHEMA), leave_tables_isolated=True, dialect=None)
                 if i in pretty:
                     o.sql(pretty=True)  # execute() builds this (debug log) before planning
                 h = ahash(o)
