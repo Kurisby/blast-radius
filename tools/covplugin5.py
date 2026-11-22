@@ -26,6 +26,8 @@ OUTDIR = os.environ["COV_OUTDIR"]
 LINES = os.environ.get("COV_LINES") == "1"
 CMP = os.environ.get("COV_CMP") == "1"
 BOOL = os.environ.get("COV_BOOL") == "1"
+KEYS = os.environ.get("COV_KEYS") == "1"
+DEFS = os.environ.get("COV_DEFS") == "1"
 MAIN = threading.main_thread().ident
 _get_ident = threading.get_ident
 mon = sys.monitoring
@@ -38,7 +40,8 @@ _base_rec = None
 
 
 def _new():
-    return {"lines": set(), "funcs": set(), "reads": set(), "classes": set(), "cmp": set(), "bool": set()}
+    return {"lines": set(), "funcs": set(), "reads": set(), "classes": set(), "cmp": set(), "bool": set(),
+            "keys": set()}
 
 
 def _set_ctx(name):
@@ -46,7 +49,7 @@ def _set_ctx(name):
     _cur["ctx"] = name
     _cur_rec = _rec.setdefault(name, _new())
     _base_rec = _rec.setdefault(name.split("#")[0], _new())
-    if LINES:
+    if LINES or DEFS:
         mon.restart_events()
 
 
@@ -312,7 +315,231 @@ class _Cmp(ast.NodeTransformer):
         return ast.copy_location(call, node)
 
 
+# ---------------------------------------------------------------- class-level dict key profile
+# Every plain dict held as a class attribute by a sqlglot class is replaced, right after its
+# module runs, by a dict subclass that records which keys each context looks up ("*" for
+# anything that reads every entry: iteration, copies, comparisons, mutation).
+import enum as _enum
+
+
+def _keyname(k):
+    if isinstance(k, type):
+        return "T:" + k.__qualname__.split(".")[-1]
+    if isinstance(k, _enum.Enum):
+        return "E:" + k.name
+    if isinstance(k, str):
+        return "S:" + k
+    if k is None or type(k) in (int, bool, float):
+        return "V:" + repr(k)
+    return "*"
+
+
+class _KeyDict(dict):
+    __slots__ = ("_owner",)
+    __hash__ = None
+
+    def _rec(self, k):
+        if getattr(_tl, "busy", False):
+            return
+        try:
+            kn = _keyname(k)
+        except Exception:  # noqa: BLE001
+            kn = "*"
+        _r()["keys"].add((self._owner, kn))
+
+    def _all(self):
+        if not getattr(_tl, "busy", False):
+            _r()["keys"].add((self._owner, "*"))
+
+    def __getitem__(self, k):
+        self._rec(k)
+        return dict.__getitem__(self, k)
+
+    def get(self, k, default=None):
+        self._rec(k)
+        return dict.get(self, k, default)
+
+    def __contains__(self, k):
+        self._rec(k)
+        return dict.__contains__(self, k)
+
+    def __iter__(self):
+        self._all()
+        return dict.__iter__(self)
+
+    def __len__(self):
+        if not getattr(_tl, "busy", False):
+            _r()["keys"].add((self._owner, "#"))
+        return dict.__len__(self)
+
+    def __reversed__(self):
+        self._all()
+        return dict.__reversed__(self)
+
+    def keys(self):
+        self._all()
+        return dict.keys(self)
+
+    def values(self):
+        self._all()
+        return dict.values(self)
+
+    def items(self):
+        self._all()
+        return dict.items(self)
+
+    def copy(self):
+        self._all()
+        return dict(dict.items(self))
+
+    def __eq__(self, other):
+        self._all()
+        return dict.__eq__(self, other)
+
+    def __ne__(self, other):
+        self._all()
+        return dict.__ne__(self, other)
+
+    def __or__(self, other):
+        self._all()
+        res = dict(dict.items(self))
+        res.update(other)
+        return res
+
+    def __ror__(self, other):
+        self._all()
+        res = dict(other)
+        res.update(dict.items(self))
+        return res
+
+    def __repr__(self):
+        self._all()
+        return dict.__repr__(self)
+
+    def __reduce__(self):
+        self._all()
+        return (dict, (dict(dict.items(self)),))
+
+    def _mut(name):
+        def f(self, *a, **k):
+            self._all()
+            return getattr(dict, name)(self, *a, **k)
+        f.__name__ = name
+        return f
+
+    for _n in ("__setitem__", "__delitem__", "__ior__", "pop", "popitem", "setdefault", "update", "clear"):
+        locals()[_n] = _mut(_n)
+    del _n, _mut
+
+
+def _keydict(src, owner):
+    d = _KeyDict(src)
+    d._owner = owner
+    _rec.setdefault("<wrapped>", _new())["keys"].add((owner, "W"))
+    return d
+
+
+class _AttrRec:
+    """Class attribute holder that records reads (non-data descriptor: instance
+    attributes still shadow it, class assignment replaces it)."""
+    __slots__ = ("_owner", "_value")
+
+    def __init__(self, owner, value):
+        self._owner = owner
+        self._value = value
+
+    def __get__(self, obj, objtype=None):
+        if not getattr(_tl, "busy", False):
+            _r()["keys"].add((self._owner, "@"))
+        return self._value
+
+
+def _wrap_cls(cls, seen):
+    import enum
+    seen.add(id(cls))
+    if issubclass(cls, enum.Enum):
+        return
+    prefix = f"{cls.__module__}:{cls.__qualname__}."
+    wrapped = _rec.setdefault("<wrapped>", _new())["keys"]
+    for attr, v in list(vars(cls).items()):
+        if attr.startswith("__") and attr.endswith("__"):
+            continue
+        if isinstance(v, type):
+            if (v.__module__ == cls.__module__ and id(v) not in seen
+                    and v.__qualname__.startswith(cls.__qualname__ + ".")):
+                _wrap_cls(v, seen)
+            continue
+        try:
+            if type(v) is dict:
+                setattr(cls, attr, _keydict(v, prefix + attr))
+            elif hasattr(type(v), "__get__") or isinstance(v, (_KeyDict, _AttrRec)):
+                continue
+            else:
+                setattr(cls, attr, _AttrRec(prefix + attr, v))
+                wrapped.add((prefix + attr, "A"))
+        except (TypeError, AttributeError):
+            pass
+
+
+_wrapped_all = [False]
+
+
+def _wrap_all_imports():
+    import importlib
+    import pkgutil
+    import sqlglot
+    for m in sorted(m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.")):
+        if m.endswith("__main__"):
+            continue
+        try:
+            importlib.import_module(m)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _wrap_all():
+    """Import every sqlglot module, then wrap the own data attributes of every sqlglot class."""
+    if _wrapped_all[0]:
+        return
+    _wrapped_all[0] = True
+    import importlib
+    import pkgutil
+    import sqlglot
+    for m in sorted(m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.")):
+        if m.endswith("__main__"):
+            continue
+        try:
+            importlib.import_module(m)
+        except Exception:  # noqa: BLE001
+            pass
+    seen = set()
+    for modname, mod in sorted(sys.modules.items()):
+        if modname != "sqlglot" and not modname.startswith("sqlglot."):
+            continue
+        for v in list(vars(mod).values()):
+            if isinstance(v, type) and v.__module__ == modname and id(v) not in seen:
+                _wrap_cls(v, seen)
+    # the generator caches a per-class copy of TRANSFORMS (plus *_sql methods) on first use:
+    # record lookups in that copy as lookups of the TRANSFORMS that it was built from
+    g = sys.modules.get("sqlglot.generator")
+    orig_bd = getattr(g, "_build_dispatch", None)
+    if orig_bd is not None:
+        def _build_dispatch(cls):
+            d = orig_bd(cls)
+            owner = next((f"{c.__module__}:{c.__qualname__}.TRANSFORMS" for c in cls.__mro__
+                          if "TRANSFORMS" in vars(c)), None)
+            if owner is None or type(d) is not dict:
+                return d
+            w = _KeyDict(d)
+            w._owner = owner
+            return w
+        g._build_dispatch = _build_dispatch
+
+
 class _Loader(importlib.abc.SourceLoader):
+    def exec_module(self, module):
+        super().exec_module(module)
+
     def __init__(self, fullname, path):
         self.fullname = fullname
         self.path = path
@@ -420,6 +647,65 @@ def _hook_classes():
         pass
 
 
+# ---------------------------------------------------------------- defaulted parameters
+# COV_DEFS=1: for every sqlglot function with default values, the parameters a call left at
+# their default (the argument is the default object), per context:
+# ("def:<file>:<co_firstlineno>", "P:<name>").
+DEF_TOOL = 4
+_DEFS = {}
+_MISSING = object()
+
+
+def _build_defs():
+    import gc
+    by_code = {}
+    for f in gc.get_objects():
+        if type(f) is not type(_build_defs):
+            continue
+        code = f.__code__
+        fn = code.co_filename
+        if not fn.startswith(SRC) or code.co_name == "<lambda>":
+            continue
+        params = {}
+        if f.__defaults__:
+            names = code.co_varnames[:code.co_argcount][-len(f.__defaults__):]
+            for n, d in zip(names, f.__defaults__):
+                params.setdefault(n, []).append(d)
+        if f.__kwdefaults__:
+            for n, d in f.__kwdefaults__.items():
+                params.setdefault(n, []).append(d)
+        if not params:
+            continue
+        owner = f"def:{fn[len(ROOT):]}:{code.co_firstlineno}"
+        cur = by_code.setdefault(code, (owner, {}))[1]
+        for n, ds in params.items():
+            cur.setdefault(n, []).extend(ds)
+    wrapped = _rec.setdefault("<wrapped>", _new())["keys"]
+    for code, (owner, params) in by_code.items():
+        _DEFS[code] = (owner, tuple((n, tuple(ds)) for n, ds in params.items()))
+        wrapped.add((owner, "D"))
+
+
+def _on_start_defs(code, offset):
+    info = _DEFS.get(code)
+    if info is None:
+        return mon.DISABLE
+    owner, params = info
+    loc = sys._getframe(1).f_locals
+    rec = _r()["keys"]
+    done = True
+    for name, ds in params:
+        k = (owner, "P:" + name)
+        if k in rec:
+            continue
+        v = loc.get(name, _MISSING)
+        if any(v is d for d in ds):
+            rec.add(k)
+        else:
+            done = False
+    return mon.DISABLE if done else None
+
+
 _active = False
 
 
@@ -428,6 +714,14 @@ def _activate():
     if _active:
         return
     _active = True
+    if KEYS:
+        _wrap_all()
+    if DEFS:
+        _wrap_all_imports()
+        _build_defs()
+        mon.use_tool_id(DEF_TOOL, "covdefs")
+        mon.register_callback(DEF_TOOL, mon.events.PY_START, _on_start_defs)
+        mon.set_events(DEF_TOOL, mon.events.PY_START)
     if LINES:
         _hook_classes()
         mon.use_tool_id(TOOL, "covplugin")
@@ -448,6 +742,7 @@ def _ser(rec):
     out["classes"] = sorted(rec["classes"])
     out["cmp"] = sorted(f"{s}|{c}" for s, c in rec["cmp"])
     out["bool"] = sorted(f"{s}|{c}" for s, c in rec["bool"])
+    out["keys"] = sorted(f"{o}|{k}" for o, k in rec["keys"])
     return out
 
 

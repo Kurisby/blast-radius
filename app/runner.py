@@ -163,6 +163,78 @@ def dump_pkg_import_lines(path: str) -> None:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+_STATEFP_CODE = r"""
+import os, sys
+sys.path.insert(0, os.environ["BR_HOOK"])
+import br_overlay
+if os.environ.get("BR_OVERLAY"):
+    br_overlay.install(os.environ["BR_ROOT"], os.environ["BR_OVERLAY"])
+sys.path.insert(0, os.environ["BR_ROOT"])
+sys.path.insert(0, os.environ["BR_APP"])
+sys.argv = ["statefp"] + sys.argv[1:]
+import statefp
+statefp.main()
+"""
+
+
+def _statefp_env(overlay):
+    env = dict(os.environ, PYTHONHASHSEED="0", BR_HOOK=HOOK, BR_ROOT=ROOT, BR_APP=APP, SKIP_INTEGRATION="0")
+    env.pop("PYTHONPATH", None)
+    if overlay:
+        env["BR_OVERLAY"] = overlay
+    else:
+        env.pop("BR_OVERLAY", None)
+    return env
+
+
+def dump_state_fp(path: str) -> None:
+    """Build step: import-time state fingerprint of the pinned commit, taken twice so that
+    entries that differ between runs are known."""
+    import json
+    import subprocess
+
+    path = os.path.abspath(path)
+    outs = []
+    for i in range(2):
+        tmp = f"{path}.{i}"
+        subprocess.run([sys.executable, "-c", _STATEFP_CODE, tmp], cwd=ROOT, env=_statefp_env(None),
+                       check=True, stdout=subprocess.DEVNULL)
+        with open(tmp) as fh:
+            outs.append(json.load(fh))
+        os.unlink(tmp)
+    a, b = outs[0]["fp"], outs[1]["fp"]
+    unstable = sorted(p for p in set(a) | set(b) if a.get(p) != b.get(p))
+    with open(path, "w") as fh:
+        json.dump({"errors": outs[0]["errors"], "fp": a, "unstable": unstable}, fh, separators=(",", ":"))
+
+
+def state_diff(key: str, files: dict, timeout: float = 30.0):
+    """Import-time state of the tree with `files` patched in, compared with the pinned
+    commit's: {"diff": [(path, kind, info)], "errors": [...], ...} or None."""
+    import json
+    import subprocess
+
+    orig = os.path.join(APP, "state_fp.json")
+    if not os.path.exists(orig):
+        return None
+    d = write_overlay("fp-" + key, files)
+    out = os.path.join(TMP, "ov", f"fp-{key}.json")
+    try:
+        subprocess.run([sys.executable, "-c", _STATEFP_CODE, out, orig], cwd=ROOT, env=_statefp_env(d),
+                       timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        with open(out) as fh:
+            return json.load(fh)
+    except Exception as e:  # noqa: BLE001
+        log("state diff failed", key, repr(e))
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+
+
 class _Timeout(BaseException):
     pass
 

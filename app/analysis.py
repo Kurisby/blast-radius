@@ -23,6 +23,8 @@ from patchutil import (
 )
 
 FULL = None  # plan value meaning "the whole test"
+# compare import-time state only when the fallback would select more tests than this
+STATEFP_MIN_TESTS = int(os.environ.get("BR_STATEFP_MIN", "6"))
 
 
 def merge_into(plan: dict, add: dict) -> None:
@@ -150,6 +152,9 @@ class Maps:
         except (OSError, ValueError):
             self.pkg_import_lines = None
         self.dialect_files = m["dialect_files"]
+        self._attrs = None
+        self.attrs_path = os.environ.get("BR_ATTRS", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                 "attrs.json.gz"))
         self.all_numbers = frozenset(self.number_by_id.values())
         self.by_test_file: dict[str, set[int]] = {}
         for t in tests:
@@ -242,6 +247,41 @@ class Maps:
             if t not in plan:
                 plan[t] = FULL
         return plan
+
+    def attrs(self):
+        """Build-time read profile of class attributes / class-dict keys, or None."""
+        if self._attrs is None:
+            try:
+                with gzip.open(self.attrs_path, "rt") as fh:
+                    a = json.load(fh)
+                a["trans"] = [self.number_by_id.get(i) for i in a["ids"]]
+                a["nontest"] = set(a["nontest"])
+                self._attrs = a
+            except (OSError, ValueError):
+                self._attrs = False
+        return self._attrs or None
+
+    def attr_entry(self, plan: dict, name: str) -> None:
+        a = self._attrs
+        e = a["attrs"].get(name)
+        if not e:
+            return
+        trans, sets = a["trans"], a["sets"]
+        glob = {trans[i] for i in sets[e[1]]}
+        for i in sets[e[0]]:
+            t = trans[i]
+            if t is not None and t in glob:
+                plan[t] = FULL
+        for tidx, sid in (e[2] if len(e) > 2 else {}).items():
+            t = trans[int(tidx)]
+            if t is None or (t in plan and plan[t] is FULL):
+                continue
+            plan.setdefault(t, set()).update(sets[sid])
+        for i in sets[e[0]]:
+            t = trans[i]
+            if t is not None and t not in plan:
+                plan[t] = FULL
+        # tests the profile cannot place (not in this run's list) are not in the plan
 
     def executed_at_runtime(self, path: str, line: int) -> bool:
         fl = self.lines.get(path)
@@ -390,6 +430,8 @@ class Analyzer:
         self._all_sources = None
         self.touched = []      # [(rel, lines)] statement-level changes of the last analyze()
         self.nonlocal_change = False
+        self.pending = []      # plans of changes whose only extra effect is import-time state
+        self._fp_n = 0
 
     def source(self, rel: str) -> str:
         if rel not in self._src:
@@ -519,7 +561,12 @@ class Analyzer:
             for loc in locs:
                 kind = loc["kind"]
                 if kind in ("func", "stmt", "funcdef"):
-                    merge_into(plan, self.maps.cover_lines(rel, loc["lines"]))
+                    cov = self.maps.cover_lines(rel, loc["lines"])
+                    if kind == "funcdef":
+                        dp = self.default_plan(rel, idx, patched, line, notes)
+                        if dp is not None:
+                            cov = intersect_plans(cov, dp)
+                    merge_into(plan, cov)
                     self.touched.append((rel, list(loc["lines"])))
                     notes.append(f"{rel}:{line} {kind}")
                     if (kind != "funcdef" or pkg is None) and imp and any(l in imp for l in loc["lines"]):
@@ -529,22 +576,81 @@ class Analyzer:
                         if pkg is not None and _dialect_own_module(rel):
                             # one dialect's module: its import-time state belongs to the
                             # dialects built on it
-                            merge_into(plan, self.module_fallback(rel))
+                            self.pending.append(self.module_fallback(rel))
                             notes.append(f"{rel}:{line} runs at dialect import")
                         else:
-                            merge_into(plan, full_plan(self.maps.all_numbers))
+                            self.pending.append(full_plan(self.maps.all_numbers))
                             notes.append(f"{rel}:{line} runs at import time")
                 elif kind == "none":
                     continue
                 elif kind == "class":
                     self.nonlocal_change = True
-                    merge_into(plan, self.class_change(rel, loc, line))
+                    self.pending.append(self.class_change(rel, loc, line))
                     notes.append(f"{rel}:{line} class {loc['qualname']}")
                 else:
                     self.nonlocal_change = True
-                    merge_into(plan, self.module_change(rel, loc, line))
+                    self.pending.append(self.module_change(rel, loc, line))
                     notes.append(f"{rel}:{line} module")
         return plan, notes
+
+    def default_plan(self, rel, idx, patched, line, notes) -> dict | None:
+        """A def header whose only change is default values: the tests in which a call left
+        one of those parameters at its default (build-time profile), or None."""
+        a = self.maps.attrs()
+        if a is None or patched is None:
+            return None
+
+        def header_of(tree):
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
+                    first = min([n.lineno] + [d.lineno for d in n.decorator_list])
+                    if first <= line < n.body[0].lineno:
+                        return n, first
+            return None, None
+
+        node, first = header_of(idx.tree)
+        try:
+            ptree = ast.parse(patched)
+        except SyntaxError:
+            return None
+        pnode, pfirst = header_of(ptree)
+        if node is None or pnode is None or first != pfirst or node.name != pnode.name:
+            return None
+
+        def shape(n):
+            args = n.args
+            return (ast.dump(ast.arguments(posonlyargs=args.posonlyargs, args=args.args, vararg=args.vararg,
+                                           kwonlyargs=args.kwonlyargs, kw_defaults=[], kwarg=args.kwarg,
+                                           defaults=[])),
+                    [ast.dump(d) for d in n.decorator_list], ast.dump(n.returns) if n.returns else "",
+                    len(args.defaults), [d is None for d in args.kw_defaults])
+
+        if shape(node) != shape(pnode):
+            return None
+        changed = []
+        pos = [x.arg for x in node.args.posonlyargs + node.args.args]
+        names = pos[len(pos) - len(node.args.defaults):]
+        for nm, d0, d1 in zip(names, node.args.defaults, pnode.args.defaults):
+            if ast.dump(d0) != ast.dump(d1):
+                changed.append(nm)
+        for kw, d0, d1 in zip(node.args.kwonlyargs, node.args.kw_defaults, pnode.args.kw_defaults):
+            if d0 is not None and ast.dump(d0) != ast.dump(d1):
+                changed.append(kw.arg)
+        if not changed:
+            return None
+        owner = f"def:{rel}:{first}"
+        if a["wrapped"].get(owner) != "D":
+            notes.append(f"default {changed}: function not profiled")
+            return None
+        plan: dict = {}
+        for nm in changed:
+            name = f"{owner}|P:{nm}"
+            if name in a["nontest"]:
+                notes.append(f"default {nm}: used outside tests")
+                return None
+            self.maps.attr_entry(plan, name)
+        notes.append(f"default {','.join(changed)} -> {len(plan)} tests")
+        return plan
 
     def class_change(self, rel, loc, line) -> dict:
         mod = rel[:-3].replace("/", ".")
@@ -662,8 +768,57 @@ class Analyzer:
             hit = file_tests
         return full_plan(hit), [f"{rel}: test code {len(hit)}"]
 
+    def state_plan(self, files: dict, notes: list) -> dict | None:
+        """Tests that read an import-time setting or table entry the patch really changes:
+        the patched tree's import-time state is compared with the pinned commit's, and
+        each difference maps to the tests whose reads the build-time profile recorded.
+        None when that cannot be answered (then the caller keeps its fallback)."""
+        a = self.maps.attrs()
+        if a is None or os.environ.get("BR_STATEFP_OFF") == "1":
+            return None
+        import runner
+
+        self._fp_n += 1
+        res = runner.state_diff(str(self._fp_n), files)
+        if res is None:
+            notes.append("state diff unavailable")
+            return None
+        if sorted(res.get("errors", [])) != sorted(res.get("orig_errors", [])):
+            notes.append(f"state diff: import errors {res.get('errors', [])[:2]}")
+            return None
+        unstable = set(res.get("unstable", ()))
+        wrapped, nontest = a["wrapped"], a["nontest"]
+        plan: dict = {}
+        for path, kind, info in res["diff"]:
+            w = wrapped.get(path)
+            if path in unstable:
+                notes.append(f"state diff: unstable {path}")
+                return None
+            if kind == "dict" and w == "W":
+                keys = info["keys"]
+                if "*" in keys:
+                    pre = path + "|"
+                    names = [n for n in a["attrs"] if n.startswith(pre)] + [n for n in nontest if n.startswith(pre)]
+                else:
+                    names = [f"{path}|{k}" for k in keys] + [f"{path}|*"]
+                    if info.get("size"):
+                        names.append(f"{path}|#")
+            elif kind == "attr" and w == "A":
+                names = [f"{path}|@"]
+            else:
+                notes.append(f"state diff: {kind} {path} not profiled")
+                return None
+            for n in names:
+                if n in nontest:
+                    notes.append(f"state diff: {n} read outside tests")
+                    return None
+                self.maps.attr_entry(plan, n)
+        notes.append(f"state diff: {len(res['diff'])} changed -> {len(plan)} tests")
+        return plan
+
     def analyze(self, patch_text: str) -> tuple[dict, list, dict]:
         self.touched = []
+        self.pending = []
         self.nonlocal_change = False
         plan: dict = {}
         notes: list = []
@@ -692,6 +847,13 @@ class Analyzer:
                 p, n = full_plan(self.maps.read_tests(rel)), [f"{rel}: other file"]
             merge_into_plan_any(plan, p)
             notes += n
+        if self.pending:
+            size = len(set().union(*self.pending))
+            sp = None
+            if ok_overlay and size > STATEFP_MIN_TESTS:
+                sp = self.state_plan(files, notes)
+            for pp in self.pending:
+                merge_into_plan_any(plan, pp if sp is None else intersect_plans(pp, sp))
         return plan, notes, (files if ok_overlay else None)
 
 
@@ -932,6 +1094,22 @@ def bool_swap(original: str, patched: str, orig_tree=None):
         return _outcome(sa, vec) != _outcome(sb, vec)
 
     return f"{root_a.lineno}:{root_a.col_offset}", line, infected
+
+
+def intersect_plans(a: dict, b: dict) -> dict:
+    """Tests/items in both plans (each an over-approximation of what one change affects)."""
+    res = {}
+    for t, w in a.items():
+        if t not in b:
+            continue
+        v = b[t]
+        if w is FULL:
+            res[t] = FULL if v is FULL else set(v)
+        elif v is FULL:
+            res[t] = set(w)
+        elif w & v:
+            res[t] = w & v
+    return res
 
 
 def merge_into_plan_any(plan, add):
