@@ -1064,10 +1064,11 @@ class Analyzer:
                 p, n = self.py_change(rel, original, patched, f["hunks"])
             elif rel.startswith("tests/fixtures/"):
                 p, n = self.fixture_change(rel, original, patched)
-                if p:
+                if p and not _outside_tpcds_inputs(rel):
                     self.nonlocal_change = self.hard_nonlocal = True
             elif rel.startswith("tests/") and rel.endswith(".py"):
-                self.nonlocal_change = self.hard_nonlocal = True
+                if not _outside_tpcds_inputs(rel):
+                    self.nonlocal_change = self.hard_nonlocal = True
                 p, n = self.test_code_change(rel, original, f["hunks"])
             else:
                 self.nonlocal_change = self.hard_nonlocal = True
@@ -1082,6 +1083,17 @@ class Analyzer:
                 # each bound is sound on its own: with the state diff, the cheap one is enough
                 merge_into_plan_any(plan, f() if sp is None else intersect_plans(b, sp))
         return plan, notes, (files if ok_overlay else None)
+
+
+def _outside_tpcds_inputs(rel: str) -> bool:
+    """A test file or fixture that the TPC-DS executor test never reads (it reads
+    tests/test_executor.py, tests/helpers.py and the TPC fixtures), so changing it cannot
+    alter that test's per-query phase checks (`nonlocal_change` only feeds those)."""
+    if rel.startswith("tests/fixtures/"):
+        return "tpc-" not in rel and rel.endswith(".sql")  # (its class setup loads tpc-h too)
+    name = rel.rsplit("/", 1)[-1]
+    return (rel.endswith(".py") and name.startswith("test_") and name != "test_executor.py"
+            and rel.count("/") <= 2)
 
 
 def _dialect_own_module(rel: str) -> bool:

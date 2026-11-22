@@ -173,19 +173,20 @@ def tpcds_est(td, spec):
             + 0.012 * len(spec["duck"]) + 0.005 * len(spec["parse"]) + 0.05)
 
 
-STRONG_GATES = ("tests/test_executor.py::TestExecutor::test_execute_tpch",
-                "tests/test_executor.py::TestExecutor::test_optimized_tpch")
+# The TPC-H executor test runs the same executor over the other TPC data: when it fails the
+# TPC-DS one did too in every local case. The optimizer TPC tests and test_optimized_tpch do
+# not settle it (several local commits fail those while the TPC-DS executor test passes, and
+# listing it then costs ~23 s), so they no longer gate it.
+STRONG_GATES = ("tests/test_executor.py::TestExecutor::test_execute_tpch",)
 
 
 def tpcds_gate(gate, est):
     """Tests whose failure settles the TPC-DS executor test as failing without running it.
-    Listing it costs ~21 s whenever it would have passed, so a gate only pays off when the
-    run is costly and the gate test is a close proxy (the other TPC executor tests)."""
+    Listing it costs ~23 s whenever it would have passed, so a gate only pays off when the
+    run is costly and the gate test is a close proxy."""
     if est <= 3.0:
         return []
-    if est <= 10.0:
-        return [g for g in gate if g in STRONG_GATES]
-    return gate
+    return [g for g in gate if g in STRONG_GATES]
 
 
 def dialects_for(files: dict, dialect_files: dict) -> list[str] | None:
