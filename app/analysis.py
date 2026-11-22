@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ast
 import gzip
+from array import array
 import json
+import marshal
 import os
 import re
 from pathlib import Path
@@ -39,10 +41,75 @@ def full_plan(tests) -> dict:
     return {t: FULL for t in tests}
 
 
+class _LazyFiles(dict):
+    """{file: marshalled per-file map}, decoded on first access."""
+
+    def get(self, key, default=None):
+        v = super().get(key)
+        if v is None:
+            return default
+        if isinstance(v, bytes):
+            v = marshal.loads(v)
+            self[key] = v
+        return v
+
+    def __getitem__(self, key):
+        v = self.get(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def values(self):
+        return [self.get(k) for k in self.keys()]
+
+    def items(self):
+        return [(k, self.get(k)) for k in self.keys()]
+
+
+class _LazySets(list):
+    """Pool of id sets stored as uint32 byte strings, decoded on access."""
+
+    def __getitem__(self, i):
+        v = list.__getitem__(self, i)
+        if isinstance(v, bytes):
+            a = array("I")
+            a.frombytes(v)
+            v = a.tolist()
+            list.__setitem__(self, i, v)
+        return v
+
+
+def compact_maps(src: str, out: str) -> None:
+    """Build step: store the map so a run decodes only the files it looks at."""
+    with gzip.open(src, "rt") as fh:
+        m = json.load(fh)
+    m["lines"] = {f: marshal.dumps(v) for f, v in m["lines"].items()}
+    m["funcs"] = {f: marshal.dumps(v) for f, v in m["funcs"].items()}
+    cmp_by_file: dict = {}
+    for site, v in (m.get("cmp") or {}).items():
+        cmp_by_file.setdefault(site.split(":")[0], {})[site] = v
+    m["cmp_files"] = {f: marshal.dumps(v) for f, v in cmp_by_file.items()}
+    m.pop("cmp", None)
+    m["sets"] = [array("I", v).tobytes() for v in m["sets"]]
+    m["format"] = "compact1"
+    with open(out, "wb") as fh:
+        marshal.dump(m, fh)
+
+
 class Maps:
     def __init__(self, path: Path, tests: list[dict]):
-        with gzip.open(path, "rt") as fh:
-            m = json.load(fh)
+        if str(path).endswith(".marshal"):
+            with open(path, "rb") as fh:
+                m = marshal.load(fh)
+            m["lines"] = _LazyFiles(m["lines"])
+            m["funcs"] = _LazyFiles(m["funcs"])
+            self._cmp_files = _LazyFiles(m.pop("cmp_files"))
+            m["cmp"] = {}
+            m["sets"] = _LazySets(m["sets"])
+        else:
+            with gzip.open(path, "rt") as fh:
+                m = json.load(fh)
+            self._cmp_files = None
         self.number_by_id = {t["id"]: t["number"] for t in tests}
         self.id_by_number = {t["number"]: t["id"] for t in tests}
         self.trans = [self.number_by_id.get(i) for i in m["ids"]]
@@ -111,7 +178,10 @@ class Maps:
         if self.cmp is None or site in self.cmp_nontest:
             return None
         plan: dict = {}
-        entries = self.cmp.get(site) or {}
+        if self._cmp_files is not None:
+            entries = (self._cmp_files.get(site.split(":")[0]) or {}).get(site) or {}
+        else:
+            entries = self.cmp.get(site) or {}
         for c in classes:
             e = entries.get(c)
             if e:

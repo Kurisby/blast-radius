@@ -24,7 +24,8 @@ from analysis import FULL, Analyzer, Maps  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 SQLGLOT = Path(os.environ.get("BR_SQLGLOT", "/sqlglot"))
-MAPS = Path(os.environ.get("BR_MAPS", os.path.join(APP, "maps.json.gz")))
+_COMPACT = os.path.join(APP, "maps.marshal")  # written at build time from maps.json.gz
+MAPS = Path(os.environ.get("BR_MAPS") or (_COMPACT if os.path.exists(_COMPACT) else os.path.join(APP, "maps.json.gz")))
 MODE = os.environ.get("BR_MODE", "run")
 DEADLINE_S = float(os.environ.get("BR_DEADLINE", "140"))
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
@@ -42,8 +43,9 @@ EXECUTOR_CLASS_SETUP = 0.35
 PER_JOB_OVERHEAD = 0.3
 # Estimates come from an unpatched run; the scoring machine and patched code can be slower.
 SAFETY = float(os.environ.get("BR_SAFETY", "1.15"))
-P_FAIL_LIKELY = 0.95  # changed optimizer fixture item: its reader almost always fails
-P_FAIL = 0.05
+P_FAIL_LIKELY = float(os.environ.get("BR_P_LIKELY", "0.95"))  # changed optimizer fixture item: its reader almost always fails
+P_FAIL = float(os.environ.get("BR_P_FAIL", "0.05"))
+BUDGET_MULT = float(os.environ.get("BR_BUDGET_MULT", "2.5"))  # 0: budget is the listing cost alone
 
 
 def log(*a):
@@ -304,7 +306,8 @@ def main() -> None:
             items.append((tid, limit, spec))
         ran = {maps.number_by_id[tid] for tid in pl["specs"]}
         # running can never be worth more CPU than listing what it runs
-        budget = max(1.0, min(output_cost(ran, duration_ms), 2.5 * pl["run_est"] + 0.8))
+        cap = BUDGET_MULT * pl["run_est"] + 0.8 if BUDGET_MULT > 0 else float("inf")
+        budget = max(1.0, min(output_cost(ran, duration_ms), cap))
         pl["budget"] = budget
         jobs.append((c, pl["files"], items, budget, module_names(pl["files"])))
     results = {}
