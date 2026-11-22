@@ -52,6 +52,10 @@ class Maps:
         self.funcs = m["funcs"]
         self.reads = m["reads"]
         self.classes = m["classes"]
+        self.classes_glob = m.get("classes_glob")
+        self.classes_items = m.get("classes_items") or {}
+        self.cmp = m.get("cmp")
+        self.cmp_nontest = set(m.get("cmp_nontest") or ())
         self.items_count = {self.trans[int(k)]: v for k, v in m["items"].items() if self.trans[int(k)] is not None}
         self.import_lines = {f: set(v) for f, v in m["import_lines"].items()}
         self.dialect_files = m["dialect_files"]
@@ -72,6 +76,23 @@ class Maps:
     def items_of(self, sid: int) -> set:
         return set(self.raw_sets[sid])
 
+    def _add_entry(self, plan: dict, e) -> None:
+        """Merge one [all, glob, {test: items}] map entry into a plan."""
+        glob = self.tests_of(e[1])
+        itemmap = e[2] if len(e) > 2 else {}
+        for t in self.tests_of(e[0]):
+            if t in glob:
+                plan[t] = FULL
+        for tidx, sid in itemmap.items():
+            t = self.trans[int(tidx)]
+            if t is None or plan.get(t, 0) is FULL:
+                continue
+            plan.setdefault(t, set()).update(self.items_of(sid))
+        # tests in "all" but neither glob nor item-resolved (should not happen): full
+        for t in self.tests_of(e[0]):
+            if t not in plan:
+                plan[t] = FULL
+
     def cover_lines(self, path: str, lines) -> dict:
         """Plan of tests that executed any of the lines (with item subsets where known)."""
         plan: dict = {}
@@ -80,22 +101,40 @@ class Maps:
             return plan
         for l in lines:
             e = fl.get(str(l))
-            if not e:
+            if e:
+                self._add_entry(plan, e)
+        return plan
+
+    def cmp_plan(self, site: str, classes) -> dict | None:
+        """Plan of tests/items in which the comparison at site saw one of the outcome classes
+        (None when the profile cannot answer for this site)."""
+        if self.cmp is None or site in self.cmp_nontest:
+            return None
+        plan: dict = {}
+        entries = self.cmp.get(site) or {}
+        for c in classes:
+            e = entries.get(c)
+            if e:
+                self._add_entry(plan, e)
+        return plan
+
+    def class_plan(self, key: str) -> dict | None:
+        """Tests (and fixture items) that instantiated the class."""
+        sid = self.classes.get(key)
+        if sid is None:
+            return None
+        if self.classes_glob is None or key.startswith("sqlglot.expressions"):
+            # expression nodes also appear through pickling/copying: whole tests only
+            return full_plan(self.tests_of(sid))
+        plan = full_plan(self.tests_of(self.classes_glob[key])) if key in self.classes_glob else {}
+        for tidx, isid in self.classes_items.get(key, {}).items():
+            t = self.trans[int(tidx)]
+            if t is None or plan.get(t, 0) is FULL:
                 continue
-            glob = self.tests_of(e[1])
-            itemmap = e[2] if len(e) > 2 else {}
-            for t in self.tests_of(e[0]):
-                if t in glob:
-                    plan[t] = FULL
-            for tidx, sid in itemmap.items():
-                t = self.trans[int(tidx)]
-                if t is None or plan.get(t, 0) is FULL:
-                    continue
-                plan.setdefault(t, set()).update(self.items_of(sid))
-            # tests in "all" but neither glob nor item-resolved (should not happen): full
-            for t in self.tests_of(e[0]):
-                if t not in plan:
-                    plan[t] = FULL
+            plan.setdefault(t, set()).update(self.items_of(isid))
+        for t in self.tests_of(sid):
+            if t not in plan:
+                plan[t] = FULL
         return plan
 
     def executed_at_runtime(self, path: str, line: int) -> bool:
@@ -318,9 +357,15 @@ class Analyzer:
     # ---- per change -----------------------------------------------------------
     def py_change(self, rel: str, original: str, patched: str | None, hunks) -> tuple[dict, list]:
         notes = []
-        if patched is not None and python_equivalent(original, patched):
+        added = [l[1:] for h in hunks for l in h["lines"] if l[:1] == "+"]
+        removed = [l[1:] for h in hunks for l in h["lines"] if l[:1] == "-"]
+        # whole-file checks are costly on big modules: only run them when they could apply
+        maybe_comment = all("#" in l or not l.strip() for l in added)
+        maybe_none = any("None" in l for l in added + removed)
+        if patched is not None and maybe_comment and python_equivalent(original, patched):
             return {}, [f"{rel}: comment-only"]
-        if patched is not None and rel != "sqlglot/executor/env.py" and none_compare_equivalent(original, patched):
+        if (patched is not None and maybe_none and rel != "sqlglot/executor/env.py"
+                and none_compare_equivalent(original, patched)):
             return {}, [f"{rel}: None-comparison swap (equivalent)"]
         if patched is None or not compiles(patched, rel):
             self.nonlocal_change = True
@@ -332,7 +377,19 @@ class Analyzer:
         idx = self.index(rel)
         if idx is None:
             return self.module_fallback(rel), [f"{rel}: original unparsable"]
+        swap = None
+        if len(added) == 1 and len(removed) == 1 and _OP_RE.search(removed[0]) and _OP_RE.search(added[0]):
+            swap = cmp_swap(original, patched, idx.tree)
+        if swap is not None:
+            site, line, classes = swap
+            loc = idx.locate(line)
+            if loc["kind"] in ("func", "stmt", "funcdef"):
+                plan = self.maps.cmp_plan(f"{rel}:{site}", classes)
+                if plan is not None:
+                    self.touched.append((rel, [line]))
+                    return plan, [f"{rel}:{line} comparison swap {site} -> {len(plan)} infected"]
         plan: dict = {}
+        imp = self.maps.import_lines.get(rel, set())
         for tag, line in changed_old_lines(hunks):
             locs = [idx.locate(line)]
             if tag == "+":
@@ -343,6 +400,12 @@ class Analyzer:
                     merge_into(plan, self.maps.cover_lines(rel, loc["lines"]))
                     self.touched.append((rel, list(loc["lines"])))
                     notes.append(f"{rel}:{line} {kind}")
+                    if imp and any(l in imp for l in loc["lines"]):
+                        # also runs while modules are imported: whatever it computes there
+                        # (type tables, tries, registries) is shared by every test
+                        self.nonlocal_change = True
+                        merge_into(plan, full_plan(self.maps.all_numbers))
+                        notes.append(f"{rel}:{line} runs at import time")
                 elif kind == "none":
                     continue
                 elif kind == "class":
@@ -358,7 +421,7 @@ class Analyzer:
     def class_change(self, rel, loc, line) -> dict:
         mod = rel[:-3].replace("/", ".")
         key = f"{mod}:{loc['qualname']}"
-        inst = self.maps.class_tests(key)
+        inst = self.maps.class_plan(key)
         if inst is None:
             return self.module_fallback(rel)
         st = loc["stmt"]
@@ -366,8 +429,20 @@ class Analyzer:
         if names:
             refs = self.name_refs(names, rel, range(st.lineno, st.end_lineno + 1))
             if refs is not None:
-                return {t: v for t, v in refs.items() if t in inst}
-        return full_plan(inst)
+                # an item observes the change only if it both uses the class and runs a reference
+                res = {}
+                for t, v in refs.items():
+                    if t not in inst:
+                        continue
+                    w = inst[t]
+                    if w is FULL:
+                        res[t] = v
+                    elif v is FULL:
+                        res[t] = set(w)
+                    elif v & w:
+                        res[t] = v & w
+                return res
+        return inst
 
     def module_change(self, rel, loc, line) -> dict:
         st = loc["stmt"]
@@ -490,6 +565,65 @@ class Analyzer:
             merge_into_plan_any(plan, p)
             notes += n
         return plan, notes, (files if ok_overlay else None)
+
+
+_SWAPS = {
+    (ast.Is, ast.Eq): ("EQNI", "ISNE", "ERR"), (ast.Eq, ast.Is): ("EQNI", "ISNE", "ERR"),
+    (ast.IsNot, ast.NotEq): ("EQNI", "ISNE", "ERR"), (ast.NotEq, ast.IsNot): ("EQNI", "ISNE", "ERR"),
+    (ast.Lt, ast.LtE): ("EQ", "ERR"), (ast.LtE, ast.Lt): ("EQ", "ERR"),
+    (ast.Gt, ast.GtE): ("EQ", "ERR"), (ast.GtE, ast.Gt): ("EQ", "ERR"),
+}
+_OP_RE = re.compile(r"==|!=|<|>|\bis\b")
+_OPNAME = {ast.Is: "is", ast.IsNot: "in", ast.Eq: "eq", ast.NotEq: "ne", ast.Lt: "lt", ast.LtE: "le",
+           ast.Gt: "gt", ast.GtE: "ge"}
+
+
+def cmp_swap(original: str, patched: str, orig_tree=None):
+    """If the patch only swaps the operator of one profiled comparison between two operators
+    that differ on a single outcome class (is/==, is not/!=, </<=, >/>=), return
+    ("line:col:op", line, outcome classes that tell them apart)."""
+    a = original.split("\n")
+    b = patched.split("\n")
+    if len(a) != len(b):
+        return None
+    diff = [i for i in range(len(a)) if a[i] != b[i]]
+    if len(diff) != 1:
+        return None
+    line = diff[0] + 1
+    try:
+        ta = orig_tree if orig_tree is not None else ast.parse(original)
+        tb = ast.parse(patched)
+    except SyntaxError:
+        return None
+    ca = {(n.lineno, n.col_offset): n for n in ast.walk(ta) if isinstance(n, ast.Compare) and n.lineno == line}
+    cb = {(n.lineno, n.col_offset): n for n in ast.walk(tb) if isinstance(n, ast.Compare) and n.lineno == line}
+    found = None
+    for k, na in ca.items():
+        nb = cb.get(k)
+        if nb is None or len(na.ops) != 1 or len(nb.ops) != 1:
+            continue
+        pair = (type(na.ops[0]), type(nb.ops[0]))
+        if pair[0] is pair[1] or pair not in _SWAPS:
+            continue
+        if any(isinstance(x, ast.Constant) and x.value is None for x in (na.left, na.comparators[0])):
+            continue
+        if found is not None:
+            return None
+        found = (k, na, nb, pair)
+    if found is None:
+        return None
+    k, na, nb, pair = found
+    # the rest of the line must be unchanged: same text before the operator and after it
+    la, lb = a[line - 1].encode("utf-8"), b[line - 1].encode("utf-8")  # offsets are in bytes
+    for n in (na.left, na.comparators[0], nb.left, nb.comparators[0]):
+        if n.lineno != line or n.end_lineno != line:
+            return None
+    if (la[: na.left.end_col_offset] != lb[: nb.left.end_col_offset]
+            or la[na.comparators[0].col_offset:] != lb[nb.comparators[0].col_offset:]
+            or ast.dump(na.left) != ast.dump(nb.left)
+            or ast.dump(na.comparators[0]) != ast.dump(nb.comparators[0])):
+        return None
+    return f"{k[0]}:{k[1]}:{_OPNAME[pair[0]]}", line, _SWAPS[pair]
 
 
 def merge_into_plan_any(plan, add):

@@ -22,9 +22,10 @@ PY
 
 COPY app /app
 # Byte-compile everything the run imports: the disk is read-only at run time.
-# Also parse the pinned commit's TPC CSVs once (the executor tests' table rows).
+# Also parse the pinned commit's TPC CSVs once (the executor tests' table rows) and record
+# which modules a warm parent pre-imports.
 RUN python -m compileall -q /sqlglot/sqlglot /sqlglot/tests /app \
-    && python -c "import sys; sys.path.insert(0, '/app'); import runner; runner.build_pre_rows('/app/pre_rows.pkl')" \
+    && python -c "import sys; sys.path.insert(0, '/app'); import runner; runner.build_pre_rows('/app/pre_rows.pkl'); runner.dump_warm_modules('/app/warm_modules.json')" \
     && chmod -R a+rX /app /sqlglot
 
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1

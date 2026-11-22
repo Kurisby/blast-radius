@@ -67,6 +67,59 @@ def cap_duckdb_threads() -> None:
     duckdb.connect = connect
 
 
+# Modules a forked child can inherit already imported, when its patch touches none of them.
+WARM_LIGHT = ("sqlglot", "sqlglot.optimizer", "sqlglot.executor", "tests.helpers")
+WARM_HEAVY = WARM_LIGHT + ("tests.test_optimizer",)
+
+
+def warm_import(heavy: bool) -> None:
+    import importlib
+
+    os.environ["SKIP_INTEGRATION"] = "0"
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    cwd = os.getcwd()
+    os.chdir(ROOT)
+    # nothing printed while importing may reach the answer stream
+    sys.stdout.flush()
+    saved_fd = os.dup(1)
+    saved_out = sys.stdout
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    try:
+        for m in (WARM_HEAVY if heavy else WARM_LIGHT):
+            importlib.import_module(m)
+    finally:
+        try:
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        os.dup2(saved_fd, 1)
+        os.close(saved_fd)
+        sys.stdout = saved_out
+        os.chdir(cwd)
+
+
+def loaded_project_modules() -> set:
+    return {m for m in sys.modules if m.split(".")[0] in ("sqlglot", "tests")}
+
+
+def dump_warm_modules(path: str) -> None:
+    """Build step: record which modules warm_import() loads (unpatched pinned commit)."""
+    import json
+    import subprocess
+
+    res = {}
+    for kind, heavy in (("light", False), ("heavy", True)):
+        code = ("import sys, json; sys.path.insert(0, %r); import runner; runner.prepare_parent(heavy=%r); "
+                "runner.warm_import(%r); print(json.dumps(sorted(runner.loaded_project_modules())))"
+                % (APP, heavy, heavy))
+        out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, check=True)
+        res[kind] = json.loads(out.stdout.strip().splitlines()[-1])
+    with open(path, "w") as fh:
+        json.dump(res, fh)
+
+
 class _Timeout(BaseException):
     pass
 
@@ -76,6 +129,7 @@ class _Abort(BaseException):
 
 
 LAZY_WAIT = []
+POOL_SWAP = []  # [original ProcessPoolExecutor, SyncPool]
 
 
 def install_sync_pool():
@@ -157,6 +211,7 @@ def install_sync_pool():
     cf.as_completed = as_completed
     LAZY_WAIT[:] = [wait, as_completed]
 
+    POOL_SWAP[:] = [cf.ProcessPoolExecutor, SyncPool]
     cf.ProcessPoolExecutor = SyncPool
     import concurrent.futures.process as cfp
     cfp.ProcessPoolExecutor = SyncPool
@@ -486,7 +541,8 @@ class TestHooks:
                 pairs = spec.get("pairs")
             for pos, item in enumerate(orig_pairs(filename)):
                 c = hooks.counter
-                hooks.counter += 1
+                if c is not None:
+                    hooks.counter += 1
                 if pool is not None and c not in pool:
                     continue
                 if pairs is not None and pos not in pairs:
@@ -500,7 +556,14 @@ class TestHooks:
                 if not spec["file"].endswith(filename):
                     return
                 lines = spec.get("lines")
+            pool = spec.get("pool")
             for pos, item in enumerate(orig_lines(filename)):
+                # items are numbered across both loaders, as in the coverage maps
+                c = hooks.counter
+                if c is not None:
+                    hooks.counter += 1
+                if pool is not None and c not in pool:
+                    continue
                 if lines is not None and pos not in lines:
                     continue
                 yield item
@@ -511,6 +574,8 @@ class TestHooks:
         self._lines = load_sql_fixtures
 
     def after_import(self, modname, mod):
+        if POOL_SWAP and getattr(mod, "ProcessPoolExecutor", None) is POOL_SWAP[0]:
+            mod.ProcessPoolExecutor = POOL_SWAP[1]  # module imported before the pool swap
         if LAZY_WAIT:
             if getattr(mod, "wait", None) is not None and getattr(mod.wait, "__module__", "") == "concurrent.futures._base":
                 mod.wait = LAZY_WAIT[0]
@@ -720,7 +785,7 @@ def proc_cpu(pid: int) -> float | None:
 
 
 def run_all(jobs_in: list[tuple[str, dict, list[tuple[str, float]]]], parallel: int = 2,
-            deadline: float | None = None) -> dict[str, dict]:
+            deadline: float | None = None, warm: dict | None = None) -> dict[str, dict]:
     """jobs_in: [(key, overlay_files, [(test_id, timeout_s)])]. Returns key -> result dict.
 
     A result has 'failed', 'passed', 'complete' (every test reported).
@@ -728,6 +793,17 @@ def run_all(jobs_in: list[tuple[str, dict, list[tuple[str, float]]]], parallel: 
     pending = list(jobs_in)
     running: dict[int, Job] = {}
     results: dict[str, dict] = {}
+    # Jobs whose patch touches none of the warm modules start from a parent that already
+    # imported them; the others are forked first, from the clean parent.
+    hot_keys = set()
+    if warm:
+        wm = set(warm.get("modules") or ())
+        cold = [j for j in pending if len(j) < 5 or set(j[4]) & wm]
+        hot = [j for j in pending if not (len(j) < 5 or set(j[4]) & wm)]
+        if len(hot) >= 2:
+            pending = cold + hot
+            hot_keys = {j[0] for j in hot}
+    warmed = [False]
 
     def start(item):
         key, files, tests = item[:3]
@@ -776,11 +852,25 @@ def run_all(jobs_in: list[tuple[str, dict, list[tuple[str, float]]]], parallel: 
     while pending or running:
         while pending and len(running) < parallel:
             if deadline is not None and time.time() > deadline:
-                for key, _, tests in pending:
+                for key in [j[0] for j in pending]:
                     results[key] = {"failed": set(), "passed": set(), "complete": False,
                                     "notes": ["deadline"], "killed": False, "seconds": 0}
                 pending = []
                 break
+            if pending[0][0] in hot_keys and not warmed[0]:
+                warmed[0] = True
+                try:
+                    warm_import(bool(warm.get("heavy")))
+                except BaseException as e:  # noqa: BLE001
+                    log("warm import failed", repr(e))
+                loaded = loaded_project_modules()
+                for j in list(pending):
+                    if set(j[4]) & loaded:  # should not happen: never run a patch on stale modules
+                        pending.remove(j)
+                        results[j[0]] = {"failed": set(), "passed": set(), "complete": False,
+                                         "notes": ["stale-warm"], "killed": False, "seconds": 0}
+                if not pending:
+                    break
             start(pending.pop(0))
         if not running:
             break

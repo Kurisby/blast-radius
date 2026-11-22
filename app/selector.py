@@ -41,7 +41,7 @@ EST_OVERRIDE = {MAX_NODES: 0.35}
 EXECUTOR_CLASS_SETUP = 0.35
 PER_JOB_OVERHEAD = 0.3
 # Estimates come from an unpatched run; the scoring machine and patched code can be slower.
-SAFETY = float(os.environ.get("BR_SAFETY", "1.4"))
+SAFETY = float(os.environ.get("BR_SAFETY", "1.15"))
 P_FAIL_LIKELY = 0.95  # changed optimizer fixture item: its reader almost always fails
 P_FAIL = 0.05
 
@@ -105,10 +105,11 @@ def tpcds_spec(td, touched, plan_items):
         return res
 
     executed = td["executed"]
-    run = items("exec")
-    parse = items("parse")
-    opt = items("optimize")
-    duck = items("duck")
+    allowed = set(plan_items)  # items the plan says can observe the change
+    run = items("exec") & allowed
+    parse = items("parse") & allowed
+    opt = items("optimize") & allowed
+    duck = items("duck") & allowed
     known = run | parse | opt | duck
     run |= (set(plan_items) - known) & executed
     parse_only = (set(plan_items) - known) - executed
@@ -135,6 +136,27 @@ def dialects_for(files: dict, dialect_files: dict) -> list[str] | None:
             return None
         res |= set(hit)
     return sorted(res)
+
+
+def module_names(files) -> list[str]:
+    res = []
+    for rel in files or {}:
+        if rel.endswith(".py"):
+            m = rel[:-3].replace("/", ".")
+            if m.endswith(".__init__"):
+                m = m[: -len(".__init__")]
+            res.append(m)
+    return res
+
+
+def load_warm(heavy: bool):
+    try:
+        with open(os.environ.get("BR_WARM", os.path.join(APP, "warm_modules.json"))) as fh:
+            d = json.load(fh)
+        return {"modules": set(d["heavy" if heavy else "light"]), "heavy": heavy}
+    except Exception as e:  # noqa: BLE001
+        log("no warm module list", repr(e))
+        return None
 
 
 def choose_split(cand, ests, seconds, duration_ms, maps, likely):
@@ -284,20 +306,21 @@ def main() -> None:
         # running can never be worth more CPU than listing what it runs
         budget = max(1.0, min(output_cost(ran, duration_ms), 2.5 * pl["run_est"] + 0.8))
         pl["budget"] = budget
-        jobs.append((c, pl["files"], items, budget))
+        jobs.append((c, pl["files"], items, budget, module_names(pl["files"])))
     results = {}
     if jobs:
         import runner
 
         heavy = any(tid.startswith(("tests/test_optimizer.py::", "tests/test_executor.py::"))
-                    for _, _, items, _ in jobs for tid, _, _ in items)
+                    for _, _, items, _, _ in jobs for tid, _, _ in items)
         runner.prepare_parent(heavy=heavy)
-        if any(tid.startswith("tests/test_executor.py::") for _, _, items, _ in jobs for tid, _, _ in items):
+        if any(tid.startswith("tests/test_executor.py::") for _, _, items, _, _ in jobs for tid, _, _ in items):
             runner.preload_executor_data()
         log("parent ready", len(jobs), "jobs")
         # longest first keeps both cores busy
         jobs.sort(key=lambda j: -plans[j[0]]["run_est"])
-        results = runner.run_all(jobs, parallel=PARALLEL, deadline=T0 + DEADLINE_S)
+        warm = load_warm(heavy) if os.environ.get("BR_WARM_OFF") != "1" else None
+        results = runner.run_all(jobs, parallel=PARALLEL, deadline=T0 + DEADLINE_S, warm=warm)
 
     out = []
     total_est = 0.0
