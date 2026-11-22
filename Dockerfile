@@ -22,7 +22,9 @@ PY
 
 COPY app /app
 # Byte-compile everything the run imports: the disk is read-only at run time.
+# Also parse the pinned commit's TPC CSVs once (the executor tests' table rows).
 RUN python -m compileall -q /sqlglot/sqlglot /sqlglot/tests /app \
+    && python -c "import sys; sys.path.insert(0, '/app'); import runner; runner.build_pre_rows('/app/pre_rows.pkl')" \
     && chmod -R a+rX /app /sqlglot
 
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1

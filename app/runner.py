@@ -41,6 +41,30 @@ def prepare_parent(heavy: bool) -> None:
             import pandas.testing  # noqa: F401
         except Exception as e:  # pragma: no cover
             log("preimport failed", repr(e))
+        cap_duckdb_threads()
+
+
+def cap_duckdb_threads() -> None:
+    """One DuckDB worker thread per connection: the container has two cores and every
+    thread's CPU is billed."""
+    try:
+        import duckdb
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(duckdb.connect, "_br_capped", False):
+        return
+    orig = duckdb.connect
+
+    def connect(database=":memory:", read_only=False, config=None, *a, **k):
+        cfg = dict(config or {})
+        cfg.setdefault("threads", 1)
+        try:
+            return orig(database, read_only, cfg, *a, **k)
+        except Exception:  # noqa: BLE001
+            return orig(database, read_only, config, *a, **k)
+
+    connect._br_capped = True
+    duckdb.connect = connect
 
 
 class _Timeout(BaseException):
@@ -158,6 +182,11 @@ def _child(wfd: int, overlay: str, tests: list[tuple[str, float]], extra: dict) 
 
     try:
         os.setpgid(0, 0)
+        try:
+            with open("/proc/self/oom_score_adj", "w") as fh:
+                fh.write("1000")  # if memory runs out, this child goes first, not the parent
+        except OSError:
+            pass
         os.environ["BR_OVERLAY"] = overlay
         os.environ["BR_ROOT"] = ROOT
         pp = os.environ.get("PYTHONPATH", "")
@@ -216,10 +245,13 @@ def _child(wfd: int, overlay: str, tests: list[tuple[str, float]], extra: dict) 
         done = set()
         failed = set()
 
+        timed_out = []
+
         def on_alarm(signum, frame):
             raise _Timeout("test timeout")
 
-        signal.signal(signal.SIGALRM, on_alarm)
+        # per-test limits are in CPU seconds of this process (all threads)
+        signal.signal(signal.SIGPROF, on_alarm)
 
         class Result(unittest.TestResult):
             def startTest(self, test):
@@ -227,10 +259,14 @@ def _child(wfd: int, overlay: str, tests: list[tuple[str, float]], extra: dict) 
                 tid = id_of.get(id(test))
                 hooks.start(tid, test)
                 if tid:
-                    signal.setitimer(signal.ITIMER_REAL, limit_of[tid])
+                    lim = limit_of[tid]
+                    if timed_out:
+                        # the patch already hung one test: give the rest little room
+                        lim = min(lim, 0.3 + 1.5 * float(spec_of[tid].get("_est", lim)))
+                    signal.setitimer(signal.ITIMER_PROF, max(0.05, lim))
 
             def stopTest(self, test):
-                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.setitimer(signal.ITIMER_PROF, 0)
                 super().stopTest(test)
                 tid = id_of.get(id(test))
                 if tid and not hooks.stop(tid):
@@ -250,6 +286,8 @@ def _child(wfd: int, overlay: str, tests: list[tuple[str, float]], extra: dict) 
 
             def addError(self, test, err):
                 super().addError(test, err)
+                if err and isinstance(err[1], _Timeout):
+                    timed_out.append(id_of.get(id(test)))
                 self._fail(test)
 
             def addFailure(self, test, err):
@@ -269,7 +307,7 @@ def _child(wfd: int, overlay: str, tests: list[tuple[str, float]], extra: dict) 
 
         res = Result()
         suite.run(res)
-        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_PROF, 0)
         for tid in limit_of:
             if tid not in done:
                 emit("FAIL", tid)  # never ran: class setup failed
@@ -319,8 +357,6 @@ def preload_executor_data():
     """Parse the TPC CSVs (pure Python, independent of sqlglot) and load the DuckDB results
     recorded at the pinned commit."""
     global PRE_ROWS, FRAMES
-    import ast
-    import csv
     import gzip
     import pickle
 
@@ -338,38 +374,59 @@ def preload_executor_data():
         log("frames unavailable", repr(e))
         FRAMES = None
     try:
-        sys.path.insert(0, ROOT)
-        rows_by = {}
-        fixtures = os.path.join(ROOT, "tests", "fixtures", "optimizer")
-        for kind, sub in (("tpch", "tpc-h"), ("tpcds", "tpc-ds")):
-            d = os.path.join(fixtures, sub)
-            for name in sorted(os.listdir(d)):
-                if not name.endswith(".csv.gz"):
-                    continue
-                table = name[: -len(".csv.gz")]
-                with open(os.path.join(d, name), "rb") as fh:
-                    gz = fh.read(2) == b"\x1f\x8b"
-                f = gzip.open(os.path.join(d, name), "rt", newline="") if gz else open(
-                    os.path.join(d, name), encoding="utf-8", newline="")
-                with f:
-                    reader = csv.reader(f, delimiter="|")
-                    next(reader)
-                    rows = []
-                    ctypes = []
-                    for row in reader:
-                        if not ctypes:
-                            for v in row:
-                                try:
-                                    ctypes.append(type(ast.literal_eval(v)))
-                                except (ValueError, SyntaxError):
-                                    ctypes.append(str)
-                        rows.append(tuple(None if (t is not str and v == "") else t(v)
-                                          for t, v in zip(ctypes, row)))
-                rows_by[(kind, table)] = rows
-        PRE_ROWS = rows_by
+        with open(os.environ.get("BR_PREROWS", os.path.join(APP, "pre_rows.pkl")), "rb") as fh:
+            PRE_ROWS = pickle.load(fh)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        PRE_ROWS = parse_tpc_rows()
     except Exception as e:  # noqa: BLE001
         log("csv preload failed", repr(e))
         PRE_ROWS = None
+
+
+def build_pre_rows(path: str) -> None:
+    """Build step: parse the pinned commit's TPC CSVs once, as the executor tests do."""
+    import pickle
+
+    with open(path, "wb") as fh:
+        pickle.dump(parse_tpc_rows(), fh, protocol=5)
+
+
+def parse_tpc_rows():
+    import ast
+    import csv
+    import gzip
+
+    rows_by = {}
+    fixtures = os.path.join(ROOT, "tests", "fixtures", "optimizer")
+    for kind, sub in (("tpch", "tpc-h"), ("tpcds", "tpc-ds")):
+        d = os.path.join(fixtures, sub)
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".csv.gz"):
+                continue
+            table = name[: -len(".csv.gz")]
+            with open(os.path.join(d, name), "rb") as fh:
+                gz = fh.read(2) == b"\x1f\x8b"
+            f = gzip.open(os.path.join(d, name), "rt", newline="") if gz else open(
+                os.path.join(d, name), encoding="utf-8", newline="")
+            with f:
+                reader = csv.reader(f, delimiter="|")
+                next(reader)
+                rows = []
+                ctypes = []
+                for row in reader:
+                    if not ctypes:
+                        for v in row:
+                            try:
+                                ctypes.append(type(ast.literal_eval(v)))
+                            except (ValueError, SyntaxError):
+                                ctypes.append(str)
+                    rows.append(tuple(None if (t is not str and v == "") else t(v)
+                                      for t, v in zip(ctypes, row)))
+            rows_by[(kind, table)] = rows
+    return rows_by
 
 
 class _ConnProxy:
@@ -422,7 +479,11 @@ class TestHooks:
         def load_sql_fixture_pairs(filename):
             spec = hooks.spec_of.get(hooks.cur) or {}
             pool = spec.get("pool")
-            pairs = spec.get("pairs") if spec.get("file", "").endswith(filename) else None
+            pairs = None
+            if spec.get("file"):
+                if not spec["file"].endswith(filename):
+                    return  # fixture-only plan: this file did not change
+                pairs = spec.get("pairs")
             for pos, item in enumerate(orig_pairs(filename)):
                 c = hooks.counter
                 hooks.counter += 1
@@ -434,7 +495,11 @@ class TestHooks:
 
         def load_sql_fixtures(filename):
             spec = hooks.spec_of.get(hooks.cur) or {}
-            lines = spec.get("lines") if spec.get("file", "").endswith(filename) else None
+            lines = None
+            if spec.get("file"):
+                if not spec["file"].endswith(filename):
+                    return
+                lines = spec.get("lines")
             for pos, item in enumerate(orig_lines(filename)):
                 if lines is not None and pos not in lines:
                     continue
@@ -640,6 +705,20 @@ def write_overlay(key: str, files: dict[str, str]) -> str:
     return d
 
 
+_TICK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def proc_cpu(pid: int) -> float | None:
+    """CPU seconds (user+sys, including reaped children) used so far by a process."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+        fields = data[data.rindex(b")") + 2:].split()
+        return (int(fields[11]) + int(fields[12]) + int(fields[13]) + int(fields[14])) / _TICK
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def run_all(jobs_in: list[tuple[str, dict, list[tuple[str, float]]]], parallel: int = 2,
             deadline: float | None = None) -> dict[str, dict]:
     """jobs_in: [(key, overlay_files, [(test_id, timeout_s)])]. Returns key -> result dict.
@@ -651,7 +730,8 @@ def run_all(jobs_in: list[tuple[str, dict, list[tuple[str, float]]]], parallel: 
     results: dict[str, dict] = {}
 
     def start(item):
-        key, files, tests = item
+        key, files, tests = item[:3]
+        budget = item[3] if len(item) > 3 else None
         overlay = write_overlay(key, files)
         r, w = os.pipe()
         sys.stdout.flush()
@@ -665,7 +745,9 @@ def run_all(jobs_in: list[tuple[str, dict, list[tuple[str, float]]]], parallel: 
                 os._exit(0)
         os.close(w)
         hard = sum(t[1] for t in tests) + 10
-        running[r] = Job(key, pid, r, tests, time.time(), hard, overlay)
+        job = Job(key, pid, r, tests, time.time(), hard, overlay)
+        job.budget = budget
+        running[r] = job
 
     def finish(job: Job, killed=False):
         try:
@@ -702,7 +784,7 @@ def run_all(jobs_in: list[tuple[str, dict, list[tuple[str, float]]]], parallel: 
             start(pending.pop(0))
         if not running:
             break
-        ready, _, _ = select.select(list(running), [], [], 0.5)
+        ready, _, _ = select.select(list(running), [], [], 0.05)
         for fd in ready:
             job = running[fd]
             chunk = os.read(fd, 65536)
@@ -724,7 +806,13 @@ def run_all(jobs_in: list[tuple[str, dict, list[tuple[str, float]]]], parallel: 
                     job.notes.append(s)
         now = time.time()
         for fd, job in list(running.items()):
-            if now - job.started > job.hard_limit or (deadline is not None and now > deadline + 20):
+            over = False
+            if job.budget is not None:
+                c = proc_cpu(job.pid)
+                if c is not None and c > job.budget:
+                    over = True
+                    job.notes.append(f"NOTE budget {c:.2f} > {job.budget:.2f}")
+            if over or now - job.started > job.hard_limit or (deadline is not None and now > deadline + 20):
                 for kill in (lambda: os.killpg(job.pid, signal.SIGKILL), lambda: os.kill(job.pid, signal.SIGKILL)):
                     try:
                         kill()

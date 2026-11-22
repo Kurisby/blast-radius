@@ -13,6 +13,10 @@ import sys
 import time
 from pathlib import Path
 
+# every thread's CPU is billed: keep numeric libraries single-threaded
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 APP = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP)
 
@@ -36,6 +40,10 @@ GENMEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
 EST_OVERRIDE = {MAX_NODES: 0.35}
 EXECUTOR_CLASS_SETUP = 0.35
 PER_JOB_OVERHEAD = 0.3
+# Estimates come from an unpatched run; the scoring machine and patched code can be slower.
+SAFETY = float(os.environ.get("BR_SAFETY", "1.4"))
+P_FAIL_LIKELY = 0.95  # changed optimizer fixture item: its reader almost always fails
+P_FAIL = 0.05
 
 
 def log(*a):
@@ -131,8 +139,8 @@ def dialects_for(files: dict, dialect_files: dict) -> list[str] | None:
 
 def choose_split(cand, ests, seconds, duration_ms, maps, likely):
     """Pick which candidates to run (the rest are listed without running) to minimise
-    estimated CPU + listed cost. Tests whose run cost is high relative to their recorded
-    time are listed first."""
+    expected CPU + listed cost. Tests likely to fail, and tests whose run cost is high
+    relative to their recorded time, are listed first."""
     order = sorted(cand, key=lambda t: (-(1.0 if t in likely else 0.0),
                                         -(ests[t] + 0.01) / (seconds[t] + 0.01)))
     n = len(order)
@@ -143,7 +151,14 @@ def choose_split(cand, ests, seconds, duration_ms, maps, likely):
         run = order[k:]
         c = output_cost(blind, duration_ms)
         if run:
-            c += sum(ests[t] for t in run) + PER_JOB_OVERHEAD
+            p_none = 1.0
+            for t in run:
+                p = P_FAIL_LIKELY if t in likely else P_FAIL
+                c += SAFETY * ests[t] + p * seconds[t]
+                p_none *= 1.0 - p
+            c += PER_JOB_OVERHEAD
+            if not blind:
+                c += 2.0 * (1.0 - p_none)  # a failing run test opens a worker
             if any(maps.id_by_number[t].startswith("tests/test_executor.py::") for t in run):
                 c += EXECUTOR_CLASS_SETUP
         if best is None or c < best[0] - 1e-9:
@@ -152,7 +167,9 @@ def choose_split(cand, ests, seconds, duration_ms, maps, likely):
     if k == n:
         return "blind", set(cand), 0.0
     mode = "run" if k == 0 else "mixed"
-    run_est = c - output_cost(blind, duration_ms)
+    run = [t for t in cand if t not in blind]
+    run_est = sum(ests[t] for t in run) + PER_JOB_OVERHEAD + (
+        EXECUTOR_CLASS_SETUP if any(maps.id_by_number[t].startswith("tests/test_executor.py::") for t in run) else 0.0)
     return mode, blind, run_est
 
 
@@ -234,6 +251,8 @@ def main() -> None:
                     spec["gate"] = gate
             if tid.startswith("tests/test_executor.py::"):
                 has_exec = True
+            spec["_est"] = round(est, 4)
+            spec["_full"] = round(cpu_est.get(tid, seconds[t]), 4)
             specs[tid] = spec
             ests[t] = est
             run_est += est
@@ -255,18 +274,25 @@ def main() -> None:
             continue
         items = []
         for tid, spec in sorted(pl["specs"].items()):
-            n = maps.number_by_id[tid]
-            limit = max(4.0, 6 * seconds[n] + 3)
+            # CPU seconds; a timeout only lists the test, it can never miss a failure
+            est = spec.get("_est", 0.3)
+            limit = 0.8 + 3.0 * max(est, min(spec.get("_full", est), 2 * est + 0.5))
             if spec.get("replica"):
-                limit = 20.0
+                limit = 3.0
             items.append((tid, limit, spec))
-        jobs.append((c, pl["files"], items))
+        ran = {maps.number_by_id[tid] for tid in pl["specs"]}
+        # running can never be worth more CPU than listing what it runs
+        budget = max(1.0, min(output_cost(ran, duration_ms), 2.5 * pl["run_est"] + 0.8))
+        pl["budget"] = budget
+        jobs.append((c, pl["files"], items, budget))
     results = {}
     if jobs:
         import runner
 
-        runner.prepare_parent(heavy=True)
-        if any(tid.startswith("tests/test_executor.py::") for _, _, items in jobs for tid, _, _ in items):
+        heavy = any(tid.startswith(("tests/test_optimizer.py::", "tests/test_executor.py::"))
+                    for _, _, items, _ in jobs for tid, _, _ in items)
+        runner.prepare_parent(heavy=heavy)
+        if any(tid.startswith("tests/test_executor.py::") for _, _, items, _ in jobs for tid, _, _ in items):
             runner.preload_executor_data()
         log("parent ready", len(jobs), "jobs")
         # longest first keeps both cores busy
@@ -287,7 +313,7 @@ def main() -> None:
                 unknown = ran - passed - failed
                 sel = failed | unknown | (pl["cand"] - ran)
                 total_est += pl["run_est"]
-                log(c, f"est {pl['run_est']:.2f} cpu {r.get('cpu') or 0:.2f} wall {r['seconds']:.2f} "
+                log(c, f"est {pl['run_est']:.2f} budget {pl.get('budget', 0):.2f} cpu {r.get('cpu') or 0:.2f} wall {r['seconds']:.2f} "
                        f"failed {len(failed)} unknown {len(unknown)}", [n for n in r["notes"] if not n.startswith("NOTE t ")][:3])
                 if os.environ.get("BR_VERBOSE"):
                     tl = sorted(((float(n.split()[-1]), n.split()[2]) for n in r["notes"] if n.startswith("NOTE t ")), reverse=True)
