@@ -45,7 +45,7 @@ PER_JOB_OVERHEAD = 0.3
 SAFETY = float(os.environ.get("BR_SAFETY", "1.15"))
 P_FAIL_LIKELY = float(os.environ.get("BR_P_LIKELY", "0.95"))  # changed optimizer fixture item: its reader almost always fails
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.05"))
-BUDGET_MULT = float(os.environ.get("BR_BUDGET_MULT", "2.5"))  # 0: budget is the listing cost alone
+BUDGET_MULT = float(os.environ.get("BR_BUDGET_MULT", "0"))  # 0: budget is the listing cost alone
 
 
 def log(*a):
