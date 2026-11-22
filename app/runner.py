@@ -715,6 +715,7 @@ def _max_nodes_replica(self):
 # Parent-side data shared with children through fork.
 PRE_ROWS = None   # {(kind, table): rows}
 TPCDS_HASHES = {}  # item -> sha1 of the optimizer output execute() works from (pinned commit)
+TPCDS_PHASHES = {}  # item -> sha1 of the parsed query the pool child receives (pinned commit)
 FRAMES = None     # {"tpch": {sql: df}, "tpcds": {sql: df}}
 
 
@@ -725,11 +726,13 @@ def preload_executor_data():
     import gzip
     import pickle
 
-    global TPCDS_HASHES
+    global TPCDS_HASHES, TPCDS_PHASHES
     try:
         import json as _json
         with gzip.open(os.path.join(APP, "tpcds.json.gz"), "rt") as fh:
-            TPCDS_HASHES = {int(k): v for k, v in _json.load(fh)["hashes"].items()}
+            d = _json.load(fh)
+        TPCDS_HASHES = {int(k): v for k, v in d["hashes"].items()}
+        TPCDS_PHASHES = {int(k): v for k, v in d.get("phashes", {}).items()}
     except Exception as e:  # noqa: BLE001
         log("tpcds hashes unavailable", repr(e))
     try:
@@ -1000,13 +1003,30 @@ class TestHooks:
                 pickle.loads(pickle.dumps(parse_one(sqls[i][1])))
         except Exception:  # noqa: BLE001
             return "fail"
-        for i in plan.get("proxy", ()):
+
+        def ahash(e):
+            return hashlib.sha1(_json.dumps(dump(e), sort_keys=True, default=str).encode()).hexdigest()
+
+        proxy = list(plan.get("proxy", ()))
+        for i in plan.get("phash", ()):
+            if i in run:
+                continue
+            try:
+                h = ahash(pickle.loads(pickle.dumps(parse_one(sqls[i][1]))))
+            except Exception:  # noqa: BLE001
+                return "fail"  # the parent parses every query before any runs
+            if h != TPCDS_PHASHES.get(i):
+                proxy.append(i)
+        pretty = set(plan.get("pretty", ()))
+        for i in proxy:
             if i in run:
                 continue
             try:
                 e = pickle.loads(pickle.dumps(parse_one(sqls[i][1])))
                 o = optimize(e, ensure_schema(helpers.TPCDS_SCHEMA), leave_tables_isolated=True, dialect=None)
-                h = hashlib.sha1(_json.dumps(dump(o), sort_keys=True, default=str).encode()).hexdigest()
+                if i in pretty:
+                    o.sql(pretty=True)  # execute() builds this (debug log) before planning
+                h = ahash(o)
             except Exception:  # noqa: BLE001
                 run.add(i)
                 continue

@@ -120,13 +120,19 @@ def tpcds_spec(td, touched, plan_items):
     run = items("exec") & allowed
     parse = items("parse") & allowed
     opt = items("optimize") & allowed
+    pretty = items("pretty") & allowed
     duck = items("duck") & allowed
-    known = run | parse | opt | duck
+    known = run | parse | opt | pretty | duck
     run |= (set(plan_items) - known) & executed
     parse_only = (set(plan_items) - known) - executed
+    proxy = ((opt | pretty) & executed) - run
     spec = {
         "run": sorted(run),
-        "proxy": sorted(((parse | opt) & executed) - run),
+        "proxy": sorted(proxy),
+        # changed only while the parent parses: the pool child gets the same query when
+        # the parsed tree hashes as at the pinned commit
+        "phash": sorted((parse & executed) - proxy - run),
+        "pretty": sorted(pretty & proxy),
         "parse": sorted((parse - executed) | parse_only),
         "duck": sorted(duck - run),
     }
@@ -158,9 +164,11 @@ def tpcds_state_spec(td, names, readers, allowed=None):
         by = {ph: acc & allowed for ph, acc in by.items()}
     executed = td["executed"]
     run = by["exec"] & executed
+    proxy = (by["optimize"] & executed) - run
     spec = {
         "run": sorted(run),
-        "proxy": sorted(((by["parse"] | by["optimize"]) & executed) - run),
+        "proxy": sorted(proxy),
+        "phash": sorted((by["parse"] & executed) - proxy - run),
         "parse": sorted(by["parse"] - executed),
         "duck": sorted((by["duck"] & executed) - run),
     }
@@ -170,7 +178,8 @@ def tpcds_state_spec(td, names, readers, allowed=None):
 def tpcds_est(td, spec):
     t = td["times"]
     return (sum(t.get(i, {}).get("exec", 0.3) for i in spec["run"]) + 0.04 * len(spec["proxy"])
-            + 0.012 * len(spec["duck"]) + 0.005 * len(spec["parse"]) + 0.05)
+            + 0.008 * len(spec.get("phash", ())) + 0.012 * len(spec["duck"])
+            + 0.005 * len(spec["parse"]) + 0.05)
 
 
 # The TPC-H executor test runs the same executor over the other TPC data: when it fails the
@@ -393,6 +402,9 @@ def main() -> None:
                             both = {"run": sorted(run)}
                             for k in ("proxy", "duck"):
                                 both[k] = sorted((set(sspec[k]) | set(lspec[k])) - run)
+                            both["phash"] = sorted((set(sspec.get("phash", ())) | set(lspec.get("phash", ())))
+                                                   - run - set(both["proxy"]))
+                            both["pretty"] = sorted(set(lspec.get("pretty", ())) & set(both["proxy"]))
                             both["parse"] = sorted(set(sspec["parse"]) | set(lspec["parse"]))
                             st = (both, tpcds_est(td, both))
                 if td is not None and isinstance(v, set) and not analyzer.nonlocal_change:
