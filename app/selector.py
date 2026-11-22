@@ -176,6 +176,49 @@ def load_warm(heavy: bool):
         return None
 
 
+def load_import_lines(maps):
+    """{rel: lines} of sqlglot function code that ran before the warm parent forks: the
+    build-time trace of importing every sqlglot module plus that of the warm import itself.
+    None when either is missing (then nothing is hot patched)."""
+    if maps.pkg_import_lines is None:
+        return None
+    try:
+        with open(os.environ.get("BR_WARM_LINES", os.path.join(APP, "warm_lines.json"))) as fh:
+            wl = json.load(fh)
+    except Exception as e:  # noqa: BLE001
+        log("no warm line trace", repr(e))
+        return None
+    res = {f: set(v) for f, v in maps.pkg_import_lines.items()}
+    for f, v in wl.items():
+        res.setdefault(f, set()).update(v)
+    return res
+
+
+def hotpatch_job(job, warm, lines, analyzer, runner):
+    """A job whose patched modules the warm parent has imported runs cold (sqlglot imported
+    again in the child) unless every such module can be hot patched: then it gets the code
+    swaps and runs from the warm parent."""
+    c, files, items, budget, mods = job
+    wm = warm["modules"]
+    if not files or not set(mods) & wm:
+        return job
+    patches = {}
+    for rel, src in files.items():
+        if not rel.endswith(".py"):
+            continue
+        m = module_names([rel])[0]
+        if m not in wm:
+            continue
+        if not rel.startswith("sqlglot/"):
+            return job
+        path = os.path.join(runner.ROOT, rel)
+        sw = runner.hotpatch_prepare(path, analyzer.source(rel), src, lines.get(rel, set()))
+        if sw is None:
+            return job
+        patches[path] = sw
+    return (c, files, items, budget, [m for m in mods if m not in wm], patches)
+
+
 def choose_split(cand, ests, seconds, duration_ms, maps, likely):
     """Pick which candidates to run (the rest are listed without running) to minimise
     expected CPU + listed cost. Tests likely to fail, and tests whose run cost is high
@@ -339,6 +382,17 @@ def main() -> None:
         # longest first keeps both cores busy
         jobs.sort(key=lambda j: -plans[j[0]]["run_est"])
         warm = load_warm(heavy) if os.environ.get("BR_WARM_OFF") != "1" else None
+        lines = load_import_lines(maps) if warm and os.environ.get("BR_HOTPATCH_OFF") != "1" else None
+        if lines is not None:
+            hp = []
+            for i, j in enumerate(jobs):
+                try:
+                    jobs[i] = hotpatch_job(j, warm, lines, analyzer, runner)
+                except Exception as e:  # noqa: BLE001
+                    log(j[0], "hotpatch check failed", repr(e))
+                if len(jobs[i]) > 5:
+                    hp.append(j[0])
+            log("hot patched", len(hp), hp[:8])
         results = runner.run_all(jobs, parallel=PARALLEL, deadline=T0 + DEADLINE_S, warm=warm)
 
     out = []

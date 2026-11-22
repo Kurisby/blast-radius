@@ -17,6 +17,8 @@ APP = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.join(APP, "hook")
 ROOT = os.environ.get("BR_SQLGLOT", "/sqlglot")
 TMP = os.environ.get("BR_TMP", "/tmp")
+GC_FREEZE = os.environ.get("BR_GC_FREEZE", "1") == "1"
+GC_THRESHOLD = int(os.environ.get("BR_GC_THRESHOLD", "0"))
 
 if HOOK not in sys.path:
     sys.path.insert(0, HOOK)
@@ -151,6 +153,184 @@ for f, l in seen:
     out.setdefault(f, []).append(l)
 json.dump({f: sorted(v) for f, v in out.items()}, open(sys.argv[1], "w"))
 """
+
+
+_WARM_LINES_CODE = r"""
+import json, os, sys
+root = os.getcwd() + "/"
+src = root + "sqlglot/"
+mon = sys.monitoring
+seen = set()
+def on_line(code, line):
+    fn = code.co_filename
+    if fn.startswith(src):
+        if code.co_flags & 1:
+            seen.add((fn[len(root):], line))
+        return mon.DISABLE
+sys.path.insert(0, os.environ["BR_APP"])
+import runner
+mon.use_tool_id(3, "warmlines")
+mon.register_callback(3, mon.events.LINE, on_line)
+mon.set_events(3, mon.events.LINE)
+runner.prepare_parent(heavy=True)
+runner.warm_import(True)
+runner.preload_executor_data()
+mon.set_events(3, 0)
+out = {}
+for f, l in seen:
+    out.setdefault(f, []).append(l)
+json.dump({f: sorted(v) for f, v in out.items()}, open(sys.argv[1], "w"))
+"""
+
+
+def dump_warm_lines(path: str) -> None:
+    """Build step: sqlglot function lines that run in the warm parent before it forks (the
+    warm import, heavy flavour, plus the executor data preload)."""
+    import subprocess
+
+    subprocess.run([sys.executable, "-c", _WARM_LINES_CODE, os.path.abspath(path)], cwd=ROOT, check=True,
+                   env=dict(os.environ, BR_APP=APP), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# -- hot patching ---------------------------------------------------------------------------
+# A patch that only changes function bodies, on lines that never ran while the warm parent
+# imported sqlglot, leaves the import-time state exactly as the pinned commit's. A child forked
+# from the warm parent then only needs the changed functions' code swapped in, instead of
+# importing sqlglot again.
+
+_CO_OPTIMIZED = 0x0001
+_BODY_ATTRS = ("co_code", "co_names", "co_varnames", "co_freevars", "co_cellvars", "co_flags", "co_argcount",
+               "co_posonlyargcount", "co_kwonlyargcount", "co_name", "co_qualname", "co_exceptiontable",
+               "co_nlocals", "co_stacksize")
+
+
+def _code_list(code, out):
+    import types
+
+    out.append(code)
+    for c in code.co_consts:
+        if isinstance(c, types.CodeType):
+            _code_list(c, out)
+    return out
+
+
+def _const_key(c):
+    import types
+
+    if isinstance(c, types.CodeType):
+        return ("<code>",)
+    if isinstance(c, tuple):
+        return (tuple, tuple(_const_key(x) for x in c))
+    if isinstance(c, frozenset):
+        return (frozenset, tuple(sorted(repr(_const_key(x)) for x in c)))
+    if isinstance(c, (float, complex)):
+        return (type(c).__name__, repr(c))
+    return (type(c).__name__, c)
+
+
+def _same_body(a, b) -> bool:
+    """Same behaviour apart from nested code objects and line numbers."""
+    return all(getattr(a, k) == getattr(b, k) for k in _BODY_ATTRS) and _const_key(a.co_consts) == _const_key(b.co_consts)
+
+
+def _changed_old_lines(old_src: str, new_src: str) -> set:
+    """Old line numbers a patch replaces or deletes; an insertion counts both neighbours."""
+    import difflib
+
+    a = old_src.splitlines()
+    b = new_src.splitlines()
+    pre = 0
+    while pre < len(a) and pre < len(b) and a[pre] == b[pre]:
+        pre += 1
+    suf = 0
+    while suf < len(a) - pre and suf < len(b) - pre and a[len(a) - 1 - suf] == b[len(b) - 1 - suf]:
+        suf += 1
+    sm = difflib.SequenceMatcher(None, a[pre:len(a) - suf], b[pre:len(b) - suf], autojunk=False)
+    res = set()
+    for tag, i1, i2, _, _ in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if i2 > i1:
+            res.update(range(pre + i1 + 1, pre + i2 + 1))
+        else:
+            res.update((pre + i1, pre + i1 + 1))
+    return res
+
+
+_OLD_CODES: dict = {}
+
+
+def hotpatch_prepare(path: str, old_src: str, new_src: str, import_lines: set):
+    """[(qualname, firstlineno, old_code, new_code)] that turn the imported module at `path`
+    into the patched one, or None when the patch changes anything but function bodies or a
+    changed line ran during the warm import."""
+    if _changed_old_lines(old_src, new_src) & set(import_lines or ()):
+        return None
+    try:
+        old = _OLD_CODES.get(path)
+        if old is None or old[0] is not old_src:
+            old = _OLD_CODES[path] = (old_src, _code_list(compile(old_src, path, "exec", dont_inherit=True), []))
+        old = old[1]
+        new = _code_list(compile(new_src, path, "exec", dont_inherit=True), [])
+    except (SyntaxError, ValueError):
+        return None
+    if len(old) != len(new):
+        return None
+    swaps = []
+    for i, (a, b) in enumerate(zip(old, new)):
+        if a.co_qualname != b.co_qualname or a.co_freevars != b.co_freevars:
+            return None
+        if not _same_body(a, b) and (i == 0 or not (a.co_flags & _CO_OPTIMIZED)):
+            return None  # module or class body
+        if a != b:
+            swaps.append((a.co_qualname, a.co_firstlineno, a, b))
+    return swaps
+
+
+def apply_hotpatch(patches: dict) -> int:
+    """Swap the patched code into the live functions; raises when a changed function that
+    must exist at import time (not nested in another function) was not found."""
+    import gc
+    import types
+
+    want = {}
+    need = set()
+    for path, swaps in patches.items():
+        for qn, fl, a, b in swaps:
+            want.setdefault((path, qn, fl), []).append((a, b))
+            # a function that is not nested in another one was created at import time: it
+            # must be found (a change nested deeper also changes its enclosing function)
+            if "<locals>" not in qn and a.co_flags & _CO_OPTIMIZED:
+                need.add((path, qn, fl))
+    done = set()
+    n = 0
+    frozen = gc.get_freeze_count()
+    if frozen:
+        gc.unfreeze()  # get_objects() does not list frozen objects
+    try:
+        objs = gc.get_objects()
+    finally:
+        if frozen:
+            gc.freeze()
+    for f in objs:
+        if type(f) is not types.FunctionType:
+            continue
+        c = f.__code__
+        k = (c.co_filename, c.co_qualname, c.co_firstlineno)
+        lst = want.get(k)
+        if not lst:
+            continue
+        for a, b in lst:
+            if c == a:
+                f.__code__ = b
+                done.add(k)
+                n += 1
+                break
+    del objs
+    missing = need - done
+    if missing:
+        raise RuntimeError(f"hotpatch: no live function for {sorted(missing)[:3]}")
+    return n
 
 
 def dump_pkg_import_lines(path: str) -> None:
@@ -351,6 +531,10 @@ def _child(wfd: int, overlay: str, tests: list[tuple[str, float]], extra: dict) 
     _last = [time.process_time()]
 
     try:
+        if GC_THRESHOLD > 0:
+            import gc
+
+            gc.set_threshold(GC_THRESHOLD, *gc.get_threshold()[1:])
         os.setpgid(0, 0)
         try:
             with open("/proc/self/oom_score_adj", "w") as fh:
@@ -365,6 +549,17 @@ def _child(wfd: int, overlay: str, tests: list[tuple[str, float]], extra: dict) 
         import br_overlay
 
         br_overlay.install(ROOT, overlay)
+        if extra.get("hotpatch"):
+            try:
+                out.write(f"NOTE hotpatch {apply_hotpatch(extra['hotpatch'])}\n")
+            except BaseException as e:  # noqa: BLE001
+                # never run tests on a half-patched tree: report every test failing
+                out.write(f"NOTE hotpatch-failed {e!r}\n")
+                for tid, *_ in tests:
+                    emit("FAIL", tid)
+                out.write("END\n")
+                out.flush()
+                os._exit(0)
 
         install_sync_pool()
 
@@ -923,15 +1118,22 @@ def run_all(jobs_in: list[tuple[str, dict, list[tuple[str, float]]]], parallel: 
     def start(item):
         key, files, tests = item[:3]
         budget = item[3] if len(item) > 3 else None
+        extra = {"hotpatch": item[5]} if len(item) > 5 and item[5] else {}
         overlay = write_overlay(key, files)
         r, w = os.pipe()
         sys.stdout.flush()
         sys.stderr.flush()
+        if GC_FREEZE:
+            # what the parent holds (imports, TPC rows, frames) is never garbage: keep the
+            # children's collections from scanning it again and again
+            import gc
+
+            gc.freeze()
         pid = os.fork()
         if pid == 0:
             os.close(r)
             try:
-                _child(w, overlay, tests, {})
+                _child(w, overlay, tests, extra)
             finally:
                 os._exit(0)
         os.close(w)
